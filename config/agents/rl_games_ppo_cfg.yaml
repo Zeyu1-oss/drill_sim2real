@@ -1,0 +1,116 @@
+params:
+  seed: 42
+
+  # TensorBoard 和日志配置
+  logger:
+    tensorboard:
+      enabled: true
+      log_dir: "logs/tensorboard"
+      # 记录额外奖励组件
+      log_reward_components: true
+
+  env:
+    clip_observations: 10.0
+    clip_actions: 1.0
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: actor_critic
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: tanh 
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+    mlp:
+      units: [512, 512]
+      activation: elu
+      d2rl: False
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: false
+  load_path: ""
+
+  config:
+    name: inspire_hand_grasp_drill_quat
+    full_experiment_name: inspire_hand_grasp_drill_quat
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: False
+    value_bootstrap: True
+
+    normalize_input: False
+    normalize_value: True
+    normalize_advantage: True
+
+    # num_actors: -1
+
+    reward_shaper:
+      scale_value: 1
+
+    gamma: 0.99      
+    tau: 0.95       
+    learning_rate: 3e-4 
+    lr_schedule:  adaptive  
+
+    kl_threshold: 0.016
+
+    score_to_win: 20000000000
+    max_epochs: 1000000
+    save_best_after: 20
+    save_frequency: 100
+    print_stats: True
+    print_stats_frequency: 20
+    num_threads: 4
+
+    # 梯度裁剪
+    grad_norm: 1  # 更严格的梯度裁剪
+
+    entropy_coef: 0.0015
+
+    truncate_grads: True
+
+    e_clip: 0.2
+    clip_value: True
+
+    horizon_length: 32
+    minibatch_size: 4096
+    mini_epochs: 4     
+    critic_coef: 2  
+    seq_length: 1
+    bounds_loss_coef: 0.0001
+
+# ============================================================
+# Mutual Reward Hyperparameters (used in grasp_drill_env.py)
+#
+# These values are currently hardcoded in _get_rewards().
+# To make them configurable, move them to drill_params in
+# the environment config and read them in __post_init__.
+#
+# mutual_reward:
+#   rot_scale: 1.0          # scale for drill orientation reward
+#   pos_scale: 1.0          # scale for drill position reward (vs goal_pos)
+#   joint_scale: 1.0        # scale for finger joint / wrist reward
+#   part_reward_scale: 0.3   # shared scale across all components
+#   rot_eps: 0.1            # epsilon for angle diff in denominator
+#   pos_eps: 0.05           # epsilon for position diff in denominator
+#   mutual_scale: 10.0      # final multiplier on combined mutual reward
+# ============================================================

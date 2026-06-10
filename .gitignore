@@ -1,0 +1,7 @@
+cat >> .gitignore << 'EOF'
+runs/
+data/
+output/
+collected_data/
+assets/
+EOF

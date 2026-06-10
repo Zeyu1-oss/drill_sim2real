@@ -1,0 +1,76 @@
+# Student: PointNet policy for GraspDrill distillation
+params:
+  seed: 42
+
+  env:
+    clip_observations: 10.0
+    clip_actions: 1.0
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  network:
+    name: a2c_pointnet
+    separate: False
+
+    space:
+      continuous:
+        mu_activation: tanh
+        sigma_activation: softplus
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+    mlp:
+      units: [512, 512]
+      activation: elu
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: false
+  load_path: ""
+
+  config:
+    name: student_pointnet_grasp_drill
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: False
+    normalize_input: False
+    normalize_value: True
+    normalize_advantage: True
+
+    gamma: 0.998
+    tau: 0.95
+    learning_rate: 1e-4
+    lr_schedule: adaptive
+
+    kl_threshold: 0.016
+
+    max_epochs: 100000
+    save_frequency: 5000
+    print_stats: True
+    print_stats_frequency: 100
+    grad_norm: 1.0
+    entropy_coef: 0.0
+    truncate_grads: True
+
+    e_clip: 0.2
+    clip_value: True
+
+    horizon_length: 32
+    minibatch_size: 4096
+    mini_epochs: 4
+    critic_coef: 1.0
+    seq_length: 1
+    bounds_loss_coef: 0.0001

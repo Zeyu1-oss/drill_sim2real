@@ -1,0 +1,59 @@
+# 场景设置 (Scene Settings)
+scene:
+  env_spacing: 3.0          # 环境间距（米）
+  replicate_physics: true   # 每个环境独立物理实例
+  clone_in_fabric: false    # 在Fabric中克隆（提升性能），对于有references的USD文件需设为False
+  table_height: 0.6         # 桌子高度（米）
+
+# 手部设置 (Hand Settings)
+hand:
+  # 执行器参数
+  effort_limit_sim: 10.0
+  velocity_limit_sim: 10.0
+  stiffness: 500.0         # 刚度，使响应更灵敏
+  damping: 50.0             # 阻尼，减少振荡
+
+  # 初始位置和旋转（相对于环境原点）
+  initial_pos: [0, 0.0, 0]   # x, y, z（米）
+  initial_rot: [1.0, 0.0, 0.0, 0.0]   # w, x, y, z（四元数）
+
+  # 接触传感器
+  activate_contact_sensors: true
+
+# 电钻设置 (Drill Settings)
+drill:
+  # 物理属性
+  mass: 0.3                 # 质量（kg）
+  scale: [1.0, 1.0, 1.0]    # 缩放 (x, y, z)
+
+  initial_pos: [0.0, 0.0, 0]   # x, y, z（相对于桌面的偏移，单位：米）
+  initial_rot: [0.0, 0.0, 0.0, 1.0]   # w, x, y, z（四元数）
+
+  # 碰撞参数
+  # contact_offset: 0.005   # 由 hyperparameters.py 统一管理（已注释，使用默认值）
+  rest_offset: 0.001        # 静止偏移（减少抖动）
+
+  # 求解器参数（已注释，固定使用 hyperparameters.py 默认值）
+  # solver_position_iteration_count: 16
+  # solver_velocity_iteration_count: 1
+  # max_angular_velocity: 1000.0
+  # max_linear_velocity: 1000.0
+
+
+termination:
+  lift_z_threshold: 0.05
+
+  # 失败：电钻掉落到初始位置以下多少米判定失败
+  # 例如：0.05 表示电钻掉到初始位置以下 5cm 判定失败
+  fall_dist: 0.2
+
+
+reward:
+  distance_reward_weight: 1.0
+  dist_reward_scale: 1.0
+  lift_reward_weight: 1.0
+
+action:
+  wrist_pos_scale: 0.01      # 手腕位置缩放 - 每步约 1cm
+  wrist_euler_scale: 0.05    # 手腕欧拉角缩放 - 每步约 3度
+  joint_pos_scale: 0.5       # 关节位置缩放 - 网络输出 1.0 产生 ~28度变化
