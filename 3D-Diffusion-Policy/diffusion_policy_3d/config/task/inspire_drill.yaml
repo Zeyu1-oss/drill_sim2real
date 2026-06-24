@@ -1,0 +1,33 @@
+name: inspire_drill
+
+task_name: inspire_drill
+
+shape_meta: &shape_meta
+  obs:
+    point_cloud:
+      # 点数 = --pc_mode + 默认合成地面 512(以 collect 启动打印的 total_pc 为准):
+      #   camera       相机 + 地面                    -> 2048+512          = 2560
+      #   robot        相机 + 机器人(1250) + 地面       -> 2048+1250+512     = 3810
+      #   robot_drill  相机 + 机器人 + 电钻(512) + 地面   -> 2048+1250+512+512 = 4322
+      # 注:机器人 npz=1280(手1024+臂256),FK 丢 5 指尖(30)-> 1250;地面默认开,恒 +512。
+      # 当前训练用 camera 模式数据集(仅相机 2048 + 地面 512,无机器人/电钻合成点):
+      shape: [3810, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [13]
+      type: low_dim
+  action:
+    shape: [13]
+
+env_runner:
+  _target_: diffusion_policy_3d.env_runner.dummy_runner.DummyRunner
+
+dataset:
+  _target_: diffusion_policy_3d.dataset.inspire_drill_dataset.InspireDrillDataset
+  zarr_path: ???
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: 42
+  val_ratio: 0.0   # 不留验证集,全部 episode 进训练(val_loss 不再记录)
+  max_train_episodes: null   # 全量3000集:zarr已重切块(chunks=8帧),随机读放大消除,无需缩集
