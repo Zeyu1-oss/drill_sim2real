@@ -1,5 +1,12 @@
 
 
+> **📌 This is the `dp3` branch of `drill_sim2real`** — a code-only snapshot of official DP3 +
+> customizations for the **InspireDrill** grasping task. **See [INSPIRE_DRILL.md](INSPIRE_DRILL.md)**
+> for what's custom, how to drop it into a fresh official clone, the data format, and how to train.
+> (Original upstream README follows.)
+
+---
+
 # <a href="https://3d-diffusion-policy.github.io">3D Diffusion Policy</a>
 
 <a href="https://3d-diffusion-policy.github.io"><strong>Project Page</strong></a>
