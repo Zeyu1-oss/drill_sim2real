@@ -63,13 +63,13 @@ def create_stage2_env_cfg(
     )
 
 def main():
-    project_root = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
     sys.path.insert(0, project_root)
 
     parser = argparse.ArgumentParser(description="Stage2 训练 - 从 success_data.pkl 加载姿态，对齐电钻到目标坐标系")
     parser.add_argument("--headless", action="store_true", help="无头模式")
     parser.add_argument("--device", type=str, default="cuda:0", help="设备")
-    parser.add_argument("--num_envs", type=int, default=4, help="并行环境数量")
+    parser.add_argument("--num_envs", type=int, default=4096, help="并行环境数量")
     parser.add_argument("--dataset", type=str, default="collected_data/success_data.pkl", help="success_data.pkl 路径")
     parser.add_argument("--rl_config", type=str, default="config/agents/rl_games_ppo_cfg.yaml", help="RL配置")
     parser.add_argument("--checkpoint", type=str, default=None, help="加载检查点（Stage1 权重）")
@@ -205,7 +205,10 @@ def main():
                                                  device=self._sim_device)
 
             if not self.unwrapped.cfg.is_finite_horizon:
-                time_outs = (~truncated_bool).to(dtype=torch.float32)
+                # time_outs = 超时截断的那一步(与官方 wrapper / stage1 写法一致)。
+                # 之前误写成 ~truncated:value_bootstrap 在几乎每一步都加 γ·V,
+                # V 指数爆炸 → 参数 NaN → "normal expects all elements of std >= 0"。
+                time_outs = truncated_bool.to(dtype=torch.float32)
                 if time_outs.dim() > 1:
                     time_outs = time_outs.squeeze(-1)
                 extras["time_outs"] = time_outs.to(device=self._rl_device)
@@ -491,13 +494,57 @@ def main():
         load_path = args.checkpoint
         load_checkpoint = True
 
+    # ── Stage1 checkpoint 观测维度扩展 ──────────────────────────────
+    # stage2 观测 = stage1 观测 + plate 位姿 7 维(pos3+quat4)。stage1 权重的输入层按新增列
+    # 零填充(零权重 → 初始行为与 stage1 完全一致,plate 维度从 0 学起);
+    # 优化器状态(exp_avg 等)中同形状张量一并填充,避免首次 update 形状不匹配。
     cleaned_checkpoint_path = None
     if load_checkpoint and load_path and os.path.exists(load_path):
         try:
             print(f"\n正在预处理检查点: {load_path}")
+            new_dim = int(cfg.observation_space)   # Stage2Env.__init__ 已把 cfg 改为 +6
             checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
+
+            old_dim = None
+            for k, v in checkpoint.get('model', {}).items():
+                if k.endswith('actor_mlp.0.weight') and torch.is_tensor(v) and v.dim() == 2:
+                    old_dim = int(v.shape[1])
+                    break
+
+            if old_dim is not None and old_dim < new_dim:
+                pad = new_dim - old_dim
+
+                def _pad_tree(node):
+                    """递归零填充 checkpoint 树中所有 [*, old_dim] 的 2 维张量。"""
+                    n = 0
+                    if isinstance(node, dict):
+                        for kk in list(node.keys()):
+                            vv = node[kk]
+                            if torch.is_tensor(vv) and vv.dim() == 2 and vv.shape[1] == old_dim:
+                                node[kk] = torch.cat(
+                                    [vv, torch.zeros(vv.shape[0], pad, dtype=vv.dtype)], dim=1)
+                                n += 1
+                            else:
+                                n += _pad_tree(vv)
+                    elif isinstance(node, list):
+                        for vv in node:
+                            n += _pad_tree(vv)
+                    return n
+
+                n_padded = _pad_tree(checkpoint)
+                cleaned_checkpoint_path = load_path + f".obs{new_dim}.tmp.pth"
+                torch.save(checkpoint, cleaned_checkpoint_path)
+                load_path = cleaned_checkpoint_path
+                print(f"  [CKPT] 观测 {old_dim} -> {new_dim}: 零填充 {n_padded} 个张量"
+                      f"(输入层权重 + 优化器动量),临时文件: {cleaned_checkpoint_path}")
+            elif old_dim == new_dim:
+                print(f"  [CKPT] 观测维度一致({new_dim}),直接加载")
+            else:
+                print(f"  [CKPT] 未识别输入层维度(old={old_dim}),按原样加载")
         except Exception as e:
-            pass
+            import traceback
+            traceback.print_exc()
+            print(f"  [CKPT] 预处理失败,按原样加载: {e}")
 
     train_params = {
         "train": True,

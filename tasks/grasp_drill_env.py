@@ -364,17 +364,6 @@ class GraspDrillSceneCfg(InteractiveSceneCfg):
     )
 
 
-    # 手指接触地面
-
-    contact_table = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Table",
-        update_period=0.0,
-        history_length=0,
-        debug_vis=False,
-        force_threshold=0.0,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Drill*"],
-    )
-
     # ground plane
     plane = AssetBaseCfg(
         prim_path="/World/GroundPlane",
@@ -428,15 +417,15 @@ class GraspDrillEnvCfg(DirectRLEnvCfg):
     terminations: Dict[str, DoneTerm] = MISSING
     events: Dict[str, EventTerm] = MISSING
     num_envs: int = 256 
-    decimation: int = 2  
+    decimation: int = 3 
     episode_length_s: float = 10  
     fall_dist: float = 0.10 
     lift_z_threshold: float = 0.03 
-    success_hold_steps: int = 100
+    success_hold_steps: int = 20
     success_hold_reward: float = 500.0  
 
-    action_smoothing: float = 0.2
-    max_joint_delta: float = 0.02
+    action_smoothing: float = 0.1
+    max_joint_delta: float = 0.01
     max_finger_delta: float = 0.03
     # 点云配置
     pc_num_points: int = 512
@@ -526,7 +515,6 @@ class GraspDrillEnv(DirectRLEnv):
     
     def __init__(self, cfg: GraspDrillEnvCfg, render_mode: str = None, debug: bool = False, **kwargs):
 
-        print("[CAM-TRACE][env-init] __init__ begin", flush=True)
         self.drill_variants = cfg.drill_variants          # only active variants
         self.num_drill_variants = len(self.drill_variants)  # for spawn/reset loop
         self.total_num_variants = cfg.total_num_variants    # for one-hot dim; fixed at training value
@@ -583,18 +571,7 @@ class GraspDrillEnv(DirectRLEnv):
         ]
         # ============================================================
 
-        print(
-            f"[CAM-TRACE][env-init] before super().__init__ enable_cameras={getattr(cfg, 'enable_cameras', 'NA')} has_cam1={getattr(cfg.scene, 'cam1', None) is not None} has_cam2={getattr(cfg.scene, 'cam2', None) is not None}",
-            flush=True,
-        )
-        try:
-            super().__init__(cfg, render_mode=render_mode, **kwargs)
-            print("[CAM-TRACE][env-init] after super().__init__", flush=True)
-        except Exception as exc:
-            import traceback
-            print(f"[CAM-TRACE][env-init][ERROR] super().__init__ failed: {exc}", flush=True)
-            traceback.print_exc()
-            raise
+        super().__init__(cfg, render_mode=render_mode, **kwargs)
 
         self.franka: Articulation = self.scene["franka"]
         self.debug = debug  # 调试模式
@@ -607,8 +584,6 @@ class GraspDrillEnv(DirectRLEnv):
         # 摩擦参数设置（IsaacLab 官方方式：PhysX tensor API）
         # ============================================================
         try:
-            print("[FRICTION] === entering friction setup ===", flush=True)
-
             # 读取配置参数（从 sim_params 中）
             # 灵巧手
             hand_s = getattr(self.cfg.sim_params, 'hand_static_friction', 1.0)
@@ -659,8 +634,6 @@ class GraspDrillEnv(DirectRLEnv):
                 print("[FRICTION] Table: not found in scene (KeyError), skipping", flush=True)
             except Exception as e:
                 print(f"[FRICTION] Table: setup failed ({e}), skipping", flush=True)
-
-            print("[FRICTION] === friction setup complete ===", flush=True)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -708,7 +681,7 @@ class GraspDrillEnv(DirectRLEnv):
           # [N]
 
         # 成功保持计数器（滑动窗口）
-        self._success_window_size = 120
+        self._success_window_size = 50
         self._success_window_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
@@ -804,6 +777,11 @@ class GraspDrillEnv(DirectRLEnv):
         }
         self._initial_upright_score = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._drill_goal_quat_per_env = torch.zeros(self.num_envs, 4, dtype=torch.float32, device=self.device)  # per-env goal quat
+        # 势函数塑形:存上一步的朝向接近度 Φ,朝向 reward = scale*(Φ_now - Φ_prev)。
+        # reset 时被覆盖成新一局初始姿态的 Φ(见 _reset_idx 末尾),切断跨局残留,
+        # 使站立/躺下都从各自初始 Φ 起步,消除初始姿态造成的 reward 基线差。
+        self._upright_phi_prev = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._euler_phi_prev = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._episode_reward_sums = {
             "approach": 0.0,
             "lift": 0.0,
@@ -879,27 +857,10 @@ class GraspDrillEnv(DirectRLEnv):
         )
         self.num_controlled_joints = len(self.controlled_joint_indices)
         
-        all_vel_limits = self.franka.data.joint_vel_limits[0]  # [num_joints, 2] or other shape
-        for i, name in enumerate(self.franka.joint_names):
-            pos = self.franka.data.joint_pos[0, i].item()
-            vel = self.franka.data.joint_vel[0, i].item()
-            try:
-                if len(all_vel_limits.shape) == 2 and all_vel_limits.shape[0] > i:
-                    vel_limit = all_vel_limits[i, 1].item()
-                else:
-                    vel_limit = 0.0
-            except Exception:
-                vel_limit = 0.0
-            controlled = "✓" if i in self.controlled_joint_indices else "✗"
-            print(f"  [{i:2d}] {controlled} {name}: pos={pos:7.4f}, vel={vel:7.4f}, vel_limit={vel_limit:6.2f}")
-        
-        
         all_limits = self.franka.data.joint_pos_limits[0]  # [num_joints, 2]
         self.joint_lower_limits = all_limits[self.controlled_joint_indices, 0]  # [num_controlled]
         self.joint_upper_limits = all_limits[self.controlled_joint_indices, 1]  # [num_controlled]
-        for i, name in enumerate(self.controlled_joint_names):
-            print(f"  {name}: [{self.joint_lower_limits[i].item():.4f}, {self.joint_upper_limits[i].item():.4f}]")
-        
+
         self.action_smoothing = getattr(cfg, 'action_smoothing', 0.3)
         self.max_joint_delta = getattr(cfg, 'max_joint_delta', 0.03)
         self.max_finger_delta = getattr(cfg, 'max_finger_delta', 0.02)
@@ -1402,6 +1363,9 @@ class GraspDrillEnv(DirectRLEnv):
         from isaaclab.managers import SceneEntityCfg
         
         total_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        # euler_gate:门控因子,由下面 r_euler 块用"到 goal_quat 的夹角"算出真值。
+        # 默认 1.0,防止 r_euler 块异常时后续 thumb/tip/success 引用到未定义变量。
+        euler_gate = torch.ones(self.num_envs, device=self.device)
         try:
             drill_quat = self.drill.data.root_quat_w
             qw, qx, qy, qz = drill_quat[:, 0], drill_quat[:, 1], drill_quat[:, 2], drill_quat[:, 3]
@@ -1417,23 +1381,15 @@ class GraspDrillEnv(DirectRLEnv):
             curr_up_z = torch.nan_to_num(curr_up_z, nan=0.0)
             self._cached_upright_score = curr_up_z
 
-            cos_10  =  0.9848
-            cos_120 = -0.5
-
-            init_cos = self._initial_upright_score.clamp(-1.0, 1.0).nan_to_num(nan=0.0)
-            angle_denom = torch.acos(init_cos.clamp(-0.9999, 0.9999))
-            curr_cos_clamped = curr_up_z.clamp(-1.0, 1.0).nan_to_num(nan=0.0)
-            curr_angle = torch.acos(curr_cos_clamped.clamp(-0.9999, 0.9999))
-            angle_denom = torch.where(angle_denom < 1e-6, torch.ones_like(angle_denom), angle_denom)
-            r_upright = 1.0 - (curr_angle / angle_denom)
-            r_upright = torch.clamp(r_upright, 0.0, 1.0)
-
-            raw = (curr_up_z - cos_120) / (cos_10 - cos_120)
-            raw = torch.clamp(raw, 0.0, 1.0)
-            upright_gate = raw ** 2
-            upright_gate = torch.clamp(upright_gate, 0.01, 1.0)
-            self._reward_components["r_upright"] = r_upright * 20
-            total_reward += r_upright * 20
+            # 势函数塑形(γ=1):r = scale*(Φ_now - Φ_prev)。只奖励"朝直立的进展":
+            # 站立(Φ≈1 不变)→0、扶正→正、被碰歪(Φ 下降)→负。Φ_prev 在 reset 时
+            # 重置为新一局初始 Φ,消除站立/躺下的初始基线差。Φ_upright 取绝对直立度[0,1]。
+            ORIENT_SCALE = 500.0
+            phi_upright = curr_up_z.clamp(0.0, 1.0)
+            r_upright = ORIENT_SCALE * (phi_upright - self._upright_phi_prev)
+            self._upright_phi_prev = phi_upright.detach()
+            self._reward_components["r_upright"] = r_upright
+            total_reward += r_upright
         except Exception as e:
             import traceback
             print(f"[WARN] r_upright failed: {e}")
@@ -1448,13 +1404,22 @@ class GraspDrillEnv(DirectRLEnv):
             # 当前与目标四元数夹角（已归一化）
             dot = (drill_quat_norm * goal_quats).sum(dim=1).abs()  # abs 处理 q 和 -q 同姿态
             dot = dot.clamp(-1.0, 1.0)
-            angle = 2.0 * torch.acos(dot)  
+            angle = 2.0 * torch.acos(dot)
 
-            euler_temp = 0.5  
-            r_euler = torch.exp(-angle / euler_temp) * 20 
+            # euler_gate:用"到 goal_quat 的夹角"做门控(替代原 upright_gate 的绝对直立度)。
+            # 越接近目标朝向 → 门越大 → thumb/tip/success 放大越多,直接激励"转到目标朝向";
+            # 且"直立但朝向错"也会被压低门,比纯直立度更贴合任务目标。
+            _GATE_ANG_MIN = 0.1745   # 10°:此内满门=1
+            _GATE_ANG_MAX = 2.0944   # 120°:此外降到下限 0.01
+            _gate_raw = torch.clamp((_GATE_ANG_MAX - angle) / (_GATE_ANG_MAX - _GATE_ANG_MIN), 0.0, 1.0)
+            euler_gate = torch.clamp(_gate_raw ** 2, 0.01, 1.0)
 
-            self._reward_components["r_euler"] = r_euler 
-            total_reward += r_euler 
+            euler_temp = 0.5
+            # 绝对值奖励:离 goal_quat 越近给分越多(每步都给,不是势差)。
+            r_euler = torch.exp(-angle / euler_temp) * 20
+
+            self._reward_components["r_euler"] = r_euler
+            total_reward += r_euler
 
             if not hasattr(self, "_euler_debug_counter"):
                 self._euler_debug_counter = 0
@@ -1487,8 +1452,8 @@ class GraspDrillEnv(DirectRLEnv):
                 drill_scale=(1,1.2,1),
                 verbose=self.debug,
             )
-            self._reward_components["thumb_distal"] = thumb_distal_reward * upright_gate
-            total_reward += thumb_distal_reward  * upright_gate
+            self._reward_components["thumb_distal"] = thumb_distal_reward * euler_gate
+            total_reward += thumb_distal_reward  * euler_gate
         except Exception as e:
             import traceback
             print(f"[WARN] thumb_distal_reward failed: {e}")
@@ -1504,8 +1469,8 @@ class GraspDrillEnv(DirectRLEnv):
                 drill_scale=(1, 1.2, 1),
                 verbose=self.debug,
             )
-            self._reward_components["tip_trigger"] = tip_trigger  * upright_gate
-            total_reward += tip_trigger * upright_gate
+            self._reward_components["tip_trigger"] = tip_trigger  * euler_gate
+            total_reward += tip_trigger * euler_gate
         except Exception as e:
             print(f"[WARN] tip_trigger_reward failed: {e}")
 
@@ -1543,8 +1508,8 @@ class GraspDrillEnv(DirectRLEnv):
             instant_success_raw = self._check_success().float()
             instant_success = instant_success_raw * 100
 
-            self._reward_components["success_now"] = instant_success * upright_gate
-            total_reward += instant_success * upright_gate
+            self._reward_components["success_now"] = instant_success * euler_gate
+            total_reward += instant_success * euler_gate
         except Exception as e:
             import traceback
             print(f"[WARN] success_now instant reward failed: {e}")
@@ -1713,7 +1678,7 @@ class GraspDrillEnv(DirectRLEnv):
         self._success_window_idx = (self._success_window_idx + 1) % self._success_window_size
         self._cached_instant_success = success_now  
 
-        lenient_success = self._success_window.sum(dim=1) >= 100
+        lenient_success = self._success_window.sum(dim=1) >= 20
         time_outs = self.episode_length_buf >= self.max_episode_length
         terminated_nan_mask = self._pending_nan_mask
         terminated = failure_terminated | terminated_nan_mask | proximal_limit_terminated 
@@ -1736,9 +1701,7 @@ class GraspDrillEnv(DirectRLEnv):
                 print("[WARN] _setup_physics_scene: 无法获取 USD stage")
                 return
             
-            # 获取 franka 的 prim path - 使用 scene["franka"]
             franka_asset = self.scene["franka"]
-            # Articulation 的 root prim
             franka_prim = franka_asset._prim  # 内部 _prim 属性
             if franka_prim is None:
                 print("[WARN] _setup_physics_scene: franka._prim 为 None，尝试其他方式")
@@ -1799,39 +1762,7 @@ class GraspDrillEnv(DirectRLEnv):
 
     def _setup_scene(self):
         """设置场景 - DirectRLEnv 版本"""
-        print("[CAM-TRACE][setup_scene] begin", flush=True)
-        print(
-            f"[CAM-TRACE][setup_scene] cfg cameras: cam1={getattr(self.cfg.scene, 'cam1', None) is not None} cam2={getattr(self.cfg.scene, 'cam2', None) is not None}",
-            flush=True,
-        )
-        try:
-            super()._setup_scene()
-            print("[CAM-TRACE][setup_scene] after super()._setup_scene()", flush=True)
-            if hasattr(self.scene, 'sensors'):
-                print(f"[CAM-TRACE][setup_scene] scene sensors keys={list(self.scene.sensors.keys())}", flush=True)
-        except Exception as exc:
-            import traceback
-            print(f"[CAM-TRACE][setup_scene][ERROR] super()._setup_scene failed: {exc}", flush=True)
-            traceback.print_exc()
-            raise
-
-        # === 给 Table template prim 添加 PhysxContactReportAPI ===
-        # 在 scene clone 之前给 template prim 加上这个 API，cloning 时会被复制到所有实例
-        try:
-            from pxr import UsdPhysics, PhysxSchema
-            import omni.usd
-            stage = omni.usd.get_context().get_stage()
-            if stage is not None:
-                table_path = "/World/envs/env_0/Table"
-                prim = stage.GetPrimAtPath(table_path)
-                if prim.IsValid():
-                    if not prim.HasAPI(PhysxSchema.PhysxContactReportAPI):
-                        cr_api = PhysxSchema.PhysxContactReportAPI.Apply(prim)
-                        cr_api.CreateThresholdAttr().Set(0.0)
-                    print(f"[INFO] Added PhysxContactReportAPI to Table template at {table_path}")
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
+        super()._setup_scene()
 
         try:
             from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Sdf
@@ -1935,23 +1866,14 @@ class GraspDrillEnv(DirectRLEnv):
 
         for camera_name in ("cam1", "cam2"):
             try:
-                print(f"[CAM-TRACE][env] reading sensor {camera_name}", flush=True)
                 sensor = self.scene.sensors.get(camera_name)
                 if sensor is None:
-                    print(f"[CAM-TRACE][env] sensor {camera_name} missing from scene.sensors", flush=True)
                     continue
                 data_types = getattr(sensor.cfg, "data_types", [])
-                print(f"[CAM-TRACE][env] sensor {camera_name} data_types={data_types}", flush=True)
                 if not data_types:
-                    print(f"[CAM-TRACE][env] sensor {camera_name} has empty data_types", flush=True)
                     continue
                 data_type = "rgb" if "rgb" in data_types else data_types[0]
-                print(f"[CAM-TRACE][env] sensor {camera_name} requesting output[{data_type}]", flush=True)
                 camera_tensor = sensor.data.output[data_type].clone()
-                print(
-                    f"[CAM-TRACE][env] sensor {camera_name} got tensor shape={tuple(camera_tensor.shape)} dtype={camera_tensor.dtype}",
-                    flush=True,
-                )
                 if data_type in {"depth", "distance_to_image_plane", "distance_to_camera"}:
                     camera_tensor[torch.isinf(camera_tensor)] = 0
                     camera_tensor = torch.nan_to_num(camera_tensor, nan=0.0, posinf=0.0, neginf=0.0)
@@ -2485,9 +2407,6 @@ class GraspDrillEnv(DirectRLEnv):
             quat = v_rot.unsqueeze(0).expand(len(vids), -1)
             state = torch.cat([pos_world, quat, torch.zeros(len(vids), 6, device=self.device)], dim=1)
             self._drill.write_root_state_to_sim(state, env_ids=vids)
-            env_list = vids.tolist()
-            print(f"[DEBUG _write_all_drill_initial_poses] variant {vid} ({v.name}): "
-                  f"envs={env_list} -> pos={v_pos.cpu().tolist()}, rot={v_rot.cpu().tolist()}")
 
     def _reset_idx(self, env_ids: torch.Tensor):
         import random
@@ -2584,45 +2503,57 @@ class GraspDrillEnv(DirectRLEnv):
         self._drill_scale[env_ids] = vid_oh @ _flat_scale.view(nv, 3)
 
         env_origins = self.scene.env_origins[env_ids]
-        drill_pos_rand = getattr(getattr(self.cfg, 'randomization', None), 'drill_pos_random_range', (0.0, 0.0, 0.0))
-        drill_rot_rand = getattr(getattr(self.cfg, 'randomization', None), 'drill_rot_random_range', (0.0, 0.0, 0.0))
 
-        drill_pos_x_delta = ((torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_pos_rand[0])
-        drill_pos_y_delta = ((torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_pos_rand[1])
-        drill_pos_z_delta = torch.zeros(n, device=self.device)
+        # --- overfit 测试钩子:外部(deploy)注入电钻初始位姿/goal 以回放 collect 记录的场景 ---
+        # 设了 self._drill_pose_override_fn(env_ids, variant_ids)->(pos_local[n,3],quat[n,4],goal[n,4])
+        # 就用注入值、跳过随机采样;否则走原随机分支(collect 用)。
+        _override = getattr(self, "_drill_pose_override_fn", None)
+        if _override is not None:
+            _pl, _q, _g = _override(env_ids, variant_ids)
+            drill_pos_world = _pl.to(self.device).float() + env_origins
+            result_quats = _q.to(self.device).float()
+            drill_initial_rot_tensor = result_quats
+            self._drill_goal_quat_per_env[env_ids] = _g.to(self.device).float()
+        else:
+            drill_pos_rand = getattr(getattr(self.cfg, 'randomization', None), 'drill_pos_random_range', (0.0, 0.0, 0.0))
+            drill_rot_rand = getattr(getattr(self.cfg, 'randomization', None), 'drill_rot_random_range', (0.0, 0.0, 0.0))
 
-        from isaaclab.utils.math import quat_mul, quat_from_euler_xyz
+            drill_pos_x_delta = ((torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_pos_rand[0])
+            drill_pos_y_delta = ((torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_pos_rand[1])
+            drill_pos_z_delta = torch.zeros(n, device=self.device)
 
-        roll  = (torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_rot_rand[0]
-        pitch = (torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_rot_rand[1]
-        yaw   = (torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_rot_rand[2]
-        result_quats = quat_from_euler_xyz(roll, pitch, yaw)
+            from isaaclab.utils.math import quat_mul, quat_from_euler_xyz
 
-        _VA = self._variant_attrs
-        env_pos_list = []
-        env_rot_list = []
-        env_goal_quat_list = []  # per-env goal quat（固定在整个 episode 中）
-        for i, eid in enumerate(env_ids.tolist()):
-            vid = variant_ids[i].item()
-            vdata = _VA[vid]
-            pos_list = vdata["initial_pos_list"]   # [P, 3]
-            num_poses = pos_list.shape[0]
-            idx = torch.randint(0, num_poses, (1,), device=self.device).item()
-            env_pos_list.append(pos_list[idx])
-            env_rot_list.append(vdata["initial_rot_list"][idx])
-            # 随机选择一个 goal，并固定在 env 级别
-            goal_list = vdata["goal_rot_list"]  # [G, 4]
-            goal_idx = torch.randint(0, goal_list.shape[0], (1,), device=self.device).item()
-            env_goal_quat_list.append(goal_list[goal_idx])
+            roll  = (torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_rot_rand[0]
+            pitch = (torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_rot_rand[1]
+            yaw   = (torch.rand(n, device=self.device) * 2.0 - 1.0) * drill_rot_rand[2]
+            result_quats = quat_from_euler_xyz(roll, pitch, yaw)
 
-        drill_initial_pos_tensor = torch.stack(env_pos_list, dim=0)  # [n, 3]
-        drill_initial_rot_tensor = torch.stack(env_rot_list, dim=0)   # [n, 4]
-        self._drill_goal_quat_per_env[env_ids] = torch.stack(env_goal_quat_list, dim=0)  # [n, 4]
+            _VA = self._variant_attrs
+            env_pos_list = []
+            env_rot_list = []
+            env_goal_quat_list = []  # per-env goal quat（固定在整个 episode 中）
+            for i, eid in enumerate(env_ids.tolist()):
+                vid = variant_ids[i].item()
+                vdata = _VA[vid]
+                pos_list = vdata["initial_pos_list"]   # [P, 3]
+                num_poses = pos_list.shape[0]
+                idx = torch.randint(0, num_poses, (1,), device=self.device).item()
+                env_pos_list.append(pos_list[idx])
+                env_rot_list.append(vdata["initial_rot_list"][idx])
+                # 随机选择一个 goal，并固定在 env 级别
+                goal_list = vdata["goal_rot_list"]  # [G, 4]
+                goal_idx = torch.randint(0, goal_list.shape[0], (1,), device=self.device).item()
+                env_goal_quat_list.append(goal_list[goal_idx])
 
-        result_quats = quat_mul(result_quats, drill_initial_rot_tensor)
+            drill_initial_pos_tensor = torch.stack(env_pos_list, dim=0)  # [n, 3]
+            drill_initial_rot_tensor = torch.stack(env_rot_list, dim=0)   # [n, 4]
+            self._drill_goal_quat_per_env[env_ids] = torch.stack(env_goal_quat_list, dim=0)  # [n, 4]
 
-        drill_pos_world = drill_initial_pos_tensor + torch.stack([drill_pos_x_delta, drill_pos_y_delta, drill_pos_z_delta], dim=1)
-        drill_pos_world += env_origins
+            result_quats = quat_mul(result_quats, drill_initial_rot_tensor)
+
+            drill_pos_world = drill_initial_pos_tensor + torch.stack([drill_pos_x_delta, drill_pos_y_delta, drill_pos_z_delta], dim=1)
+            drill_pos_world += env_origins
         drill_root_state = torch.cat([drill_pos_world, result_quats, torch.zeros(n, 6, device=self.device)], dim=1)
         self._drill.write_root_state_to_sim(drill_root_state, env_ids=env_ids)
 
@@ -2676,6 +2607,15 @@ class GraspDrillEnv(DirectRLEnv):
         )
         self._initial_upright_score[env_ids] = initial_up.clamp(-1.0, 1.0).nan_to_num(nan=0.0)
 
+        # 势函数塑形:把朝向 Φ_prev 重置为新一局初始姿态的 Φ,切断上一局残留,
+        # 使新一局的朝向进展从 0 起步(配合 _get_rewards 的 r_upright/r_euler 势差)。
+        self._upright_phi_prev[env_ids] = initial_up.clamp(0.0, 1.0).nan_to_num(nan=0.0)
+        _gq0 = self._drill_goal_quat_per_env[env_ids]
+        _dq0 = torch.nn.functional.normalize(result_quats, dim=1)
+        _dot0 = (_dq0 * _gq0).sum(dim=1).abs().clamp(-1.0, 1.0)
+        _angle0 = 2.0 * torch.acos(_dot0)
+        self._euler_phi_prev[env_ids] = torch.exp(-_angle0 / 0.5).nan_to_num(nan=0.0)
+
 
 def create_grasp_drill_env_cfg(
     num_envs: int = 4096,
@@ -2686,8 +2626,8 @@ def create_grasp_drill_env_cfg(
     drill_variants_path: str = None,
     debug: bool = False,
     enable_pc_viz: bool = False,
-    img_height: int = 128,
-    img_width: int = 128,
+    img_height: int = 512,
+    img_width: int = 512,
     enable_cameras: bool = True,
 ) -> GraspDrillEnvCfg:
     import os
@@ -3068,18 +3008,19 @@ def create_grasp_drill_env_cfg(
     cfg.num_rerenders_on_reset = 3
     cfg.sim.render.antialiasing_mode = "Off"
 
-    # Camera configs for DP3 data collection (registered as scene sensors via InteractiveSceneCfg)
     _cam_focal_length = 24.0
     _cam_horiz_aperture = 20.955
     _cam_clipping = (0.01, 3.0)
 
-    _cam1_pos = (2.1, 0.2,0.2)
-    _cam1_rot = (0.0, -0.707, 0.0, 0.707)
+    _cam1_pos = (1.4, -0.6,1.1)
+    _cam1_rot = (0.3522, -0.6717, -0.651, -0.0308)
 
-    # _cam2_pos = (0.8, -1.2, 0.3)
-    # _cam2_rot = (0.5, -0.5, 0.5, 0.5)
-    _cam2_pos = (0.8, 0.2, 2)
-    _cam2_rot = (0.0, 1.0, 0.0, 0.0)
+
+
+    _cam2_pos = (1, 1.1, 1.3)
+    _cam2_rot = (0.0, 0.0, 0.9659, -0.2588)
+    # _cam2_pos = (0.8, 0.2, 2)
+    # _cam2_rot = (0.0, 1.0, 0.0, 0.0)
     def _make_cam_cfg(name, pos, rot):
         return TiledCameraCfg(
             prim_path=f"{{ENV_REGEX_NS}}/{name}",
@@ -3098,6 +3039,8 @@ def create_grasp_drill_env_cfg(
 
     if enable_cameras:
         cfg.scene.cam1 = _make_cam_cfg("Camera1", _cam1_pos, _cam1_rot)
+        # cam1: 30cm 跟随框采 1024 点(电钻细节);cam2(正上方俯视,位置不变):不跟随,
+        # 在固定工作区采 1024 点(全局上下文,像素充足几乎不塌)。collect/deploy 已同步。
         cfg.scene.cam2 = _make_cam_cfg("Camera2", _cam2_pos, _cam2_rot)
 
     return cfg

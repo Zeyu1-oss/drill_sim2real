@@ -58,7 +58,7 @@ def stage2_alignment_reward(
 
     drill_pos = env.drill.data.root_pos_w
     drill_quat = env.drill.data.root_quat_w
-    target_pos = env.target_pos
+    target_pos = env.target_stage2_alignment_rewardpos
     target_quat = env.target_quat
 
     # 位置误差
@@ -129,13 +129,7 @@ def stage2_grasp_quality_reward(
     all_hand_sensors = [
         "contact_index_intermediate",
         "contact_thumb_distal",
-        "contact_middle_intermediate",
-        "contact_ring_intermediate",
-        "contact_pinky_intermediate",
-        "contact_thumb_intermediate",
-        "contact_thumb_proximal_base",
-        "contact_thumb_proximal",
-        "contact_index_proximal",
+        "contact_middle_intermal",
         "contact_middle_proximal",
         "contact_ring_proximal",
         "contact_pinky_proximal",

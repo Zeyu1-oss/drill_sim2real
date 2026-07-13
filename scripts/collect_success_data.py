@@ -1,22 +1,4 @@
-#!/usr/bin/env python3
-"""
 
-
-收集的数据（每个成功 episode 一条记录）：
-  - full_obs: policy 观测向量 (51维 = 关节26 + variant_onehot3 + drill位姿13 + 距离9)
-  - joint_pos: controlled joint positions (13-dim, matching _get_observations)
-  - joint_vel: controlled joint velocities (13-dim, matching _get_observations)
-  - drill_pos: drill 世界坐标位置 (3维)
-  - drill_quat: drill 四元数 wxyz (4维)
-  - drill_lin_vel: drill 线速度 (3维)
-  - drill_ang_vel: drill 角速度 (3维)
-  - variant_idx: drill variant 全局索引
-  - variant_name: variant 名称
-  - episode_reward: 该 episode 的累计奖励
-  - success_hold_steps: 成功保持的步数（从首次成功到episode结束）
-
-
-"""
 
 import argparse
 import os
@@ -28,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-project_root = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
 sys.path.insert(0, project_root)
 
 
@@ -37,7 +19,7 @@ def main():
     parser.add_argument("--num_envs", type=int, default=2048, help="并行环境数量")
     parser.add_argument("--device", type=str, default="cuda:0", help="设备")
     parser.add_argument("--checkpoint", type=str, required=True, help="检查点路径")
-    parser.add_argument("--num_samples", type=int, default=10000, help="收集的样本数量")
+    parser.add_argument("--num_samples", type=int, default=1000, help="收集的样本数量")
     parser.add_argument("--output", type=str, default="collected_data/success_data.pkl",
                        help="输出文件路径")
     parser.add_argument("--headless", action="store_true", help="无头模式")
@@ -46,8 +28,10 @@ def main():
     parser.add_argument("--drill_configs", type=str, default=None,
                        help="多电钻配置文件路径（YAML）")
     parser.add_argument("--frame-scale", type=float, default=0.5, help="调试坐标系大小")
-    parser.add_argument("--history-len", type=int, default=5,
-                       help="成功时回溯的步数（保存成功前第N步的数据）")
+    parser.add_argument("--history-len", type=int, default=0,
+                       help="相对成功时刻回溯的步数;0=成功当步(step 前)的状态。"
+                            "缓存在成功持续期间每步刷新,episode 结束时保存的是"
+                            "最后一次仍处于成功状态的抓取姿态")
     parser.add_argument("--playback", type=str, default=None,
                        help="PKL文件路径：从PKL读取joint+drill数据来驱动每回合初始状态（joint和drill共用同一条数据）")
     args = parser.parse_args()
@@ -99,6 +83,7 @@ def main():
             headless=args.headless,
             debug=args.debug,
             drill_config_path=args.drill_configs,
+            enable_cameras=False,   # 纯状态收集,不需要相机(默认 True 会崩/耗显存)
         )
         cfg.debug_frame_scale = args.frame_scale
         cfg.seed = args.seed
@@ -190,12 +175,8 @@ def main():
         # episode_state: 0=未成功过, 1=已成功(等待episode结束), 2=本episode已收集
         episode_state = torch.zeros(args.num_envs, dtype=torch.long, device=args.device)
 
-        # 缓存成功时刻的完整观测（用于后续 relabel）
-        _success_obs_cache = [None] * args.num_envs
         _success_reward_cache = [0.0] * args.num_envs
         _success_step_cache = [0] * args.num_envs
-        # 关键修复：在首次成功时缓存所有状态，避免 _reset_idx 后读取到新 episode 状态
-        _success_state_cache = [None] * args.num_envs
 
         # 上一步的 obs 和关节状态（用于在成功时保存"成功前一 step"的数据）
         env_unwrapped = env.unwrapped
@@ -223,6 +204,19 @@ def main():
         _dlv_buf = env_unwrapped.drill.data.root_lin_vel_w.cpu().clone()
         _dav_buf = env_unwrapped.drill.data.root_ang_vel_w.cpu().clone()
         _eo_buf = env_unwrapped.scene.env_origins.cpu().clone()
+
+        # 批量成功缓存(向量化,CPU):成功持续期间每步覆盖刷新,episode 结束时
+        # 缓存内容即"最后一次仍处于成功状态"的完整状态——这才是要收集的最终抓取姿态。
+        # (旧逻辑只在首次成功时缓存一次,存的是刚过成功阈值、甚至回退 N 步的中间姿态)
+        _cache_valid = torch.zeros(args.num_envs, dtype=torch.bool)
+        _cache_obs = torch.zeros_like(_obs_buf)
+        _cache_jp = torch.zeros_like(_jp_buf)
+        _cache_jv = torch.zeros_like(_jv_buf)
+        _cache_dp = torch.zeros_like(_dp_buf)
+        _cache_dq = torch.zeros_like(_dq_buf)
+        _cache_dlv = torch.zeros_like(_dlv_buf)
+        _cache_dav = torch.zeros_like(_dav_buf)
+        _cache_eo = torch.zeros_like(_eo_buf)
 
         collected_samples = []
         collected_count = 0
@@ -293,40 +287,31 @@ def main():
                 # ============================================================
                 # 跟踪每个 env 的 episode 状态
                 # ============================================================
-                # 刚变为成功（且之前未成功过）→ 从环形缓冲区取前 N 步的数据
                 just_became_success = (episode_state == 0) & current_success
+
+                # —— 缓存刷新(向量化):成功持续期间每一步都覆盖写,episode 结束时
+                #    缓存内容 = 最后一次仍处于成功状态的姿态(history_len>0 可再回退)。
+                #    tail 指向本步 step 前捕获的状态(_hist_head 已 +1)。
+                tail = (_hist_head - args.history_len - 1) % HISTORY
+                if _hist_obs[tail] is not None and current_success.any():
+                    sel = current_success.detach().cpu()
+                    _cache_valid |= sel
+                    _cache_obs[sel] = _hist_obs[tail][sel]
+                    _cache_jp[sel] = _hist_joint_pos[tail][sel]
+                    _cache_jv[sel] = _hist_joint_vel[tail][sel]
+                    _cache_dp[sel] = _hist_drill_pos_w[tail][sel]
+                    _cache_dq[sel] = _hist_drill_quat_w[tail][sel]
+                    _cache_dlv[sel] = _hist_drill_lin_vel[tail][sel]
+                    _cache_dav[sel] = _hist_drill_ang_vel[tail][sel]
+                    _cache_eo[sel] = _hist_env_origins[tail][sel]
+
+                # 首次成功:初始化 episode 统计
                 for env_idx in torch.where(just_became_success)[0]:
                     idx = env_idx.item()
-                    # 从环形缓冲区取成功前第 history_len 步的数据
-                    # 问题 1 fix: _hist_head 已 +1，指向"下一帧"
-                    # tail = (_hist_head - 1) → step N
-                    # tail = (_hist_head - 2) → step N-1
-                    # ...
-                    # tail = (_hist_head - 6) → step N-5 ← 我们要的
-                    tail = (_hist_head - args.history_len - 1) % HISTORY
-
-                    # 问题 4 fix: 防御未填满的 buffer（初始几步）
-                    if _hist_obs[tail] is None:
-                        _success_obs_cache[idx] = None
-                        continue
-
-                    _success_obs_cache[idx] = _hist_obs[tail][idx].clone()
-                    _success_state_cache[idx] = {
-                        "joint_pos": _hist_joint_pos[tail][idx].clone(),
-                        "joint_vel": _hist_joint_vel[tail][idx].clone(),
-                        "drill_pos_world": _hist_drill_pos_w[tail][idx].clone(),
-                        "drill_quat": _hist_drill_quat_w[tail][idx].clone(),
-                        "drill_lin_vel": _hist_drill_lin_vel[tail][idx].clone(),
-                        "drill_ang_vel": _hist_drill_ang_vel[tail][idx].clone(),
-                        "env_origin": _hist_env_origins[tail][idx].clone(),
-                    }
-
-                    # 缓存其他状态
                     _success_reward_cache[idx] = 0.0
                     _success_step_cache[idx] = step_count
-
                     if args.debug and idx < 4:
-                        print(f"  [DEBUG] env={idx} 首次成功 (step={step_count}, saved=step-{args.history_len})")
+                        print(f"  [DEBUG] env={idx} 首次成功 (step={step_count})")
 
                 # 累加 episode 奖励（在成功窗口内持续累加）
                 success_mask = episode_state == 1
@@ -344,11 +329,20 @@ def main():
                 if can_collect.any():
                     for env_idx in torch.where(can_collect)[0]:
                         idx = env_idx.item()
-                        cached_obs = _success_obs_cache[idx]
 
-                        if cached_obs is not None:
-                            cached_state = _success_state_cache[idx]
-                            sample = _build_sample(env_unwrapped, idx, cached_obs,
+                        if _cache_valid[idx]:
+                            # 必须 clone:单行索引是视图,_build_sample 的 .numpy() 共享内存,
+                            # 不 clone 的话该 env 下一局刷新缓存会篡改已收集样本
+                            cached_state = {
+                                "joint_pos": _cache_jp[idx].clone(),
+                                "joint_vel": _cache_jv[idx].clone(),
+                                "drill_pos_world": _cache_dp[idx].clone(),
+                                "drill_quat": _cache_dq[idx].clone(),
+                                "drill_lin_vel": _cache_dlv[idx].clone(),
+                                "drill_ang_vel": _cache_dav[idx].clone(),
+                                "env_origin": _cache_eo[idx].clone(),
+                            }
+                            sample = _build_sample(env_unwrapped, idx, _cache_obs[idx].clone(),
                                                    _success_reward_cache[idx],
                                                    step_count - _success_step_cache[idx],
                                                    cached_state)
@@ -359,10 +353,9 @@ def main():
                                 break
 
                         # 重置该 env 的缓存
-                        _success_obs_cache[idx] = None
+                        _cache_valid[idx] = False
                         _success_reward_cache[idx] = 0.0
                         _success_step_cache[idx] = 0
-                        _success_state_cache[idx] = None
                         episode_state[env_idx] = 2
 
                 # ============================================================
@@ -377,12 +370,11 @@ def main():
                     # state==2: 已被收集，等待重置回参与状态
                     episode_state[reset_0 | reset_1 | reset_2] = 0
                     # 清理 state 0/1 的缓存（state 2 缓存已在收集时清空，无需再清）
+                    _cache_valid[(reset_0 | reset_1).detach().cpu()] = False
                     for env_idx in torch.where(reset_0 | reset_1)[0]:
                         idx = env_idx.item()
-                        _success_obs_cache[idx] = None
                         _success_reward_cache[idx] = 0.0
                         _success_step_cache[idx] = 0
-                        _success_state_cache[idx] = None
 
                 # ============================================================
                 # 进度打印（基于步数 + ETA）
@@ -440,7 +432,7 @@ def main():
         if output_dir and not os.path.exists(output_dir):
             os.makedirs(output_dir, exist_ok=True)
 
-        save_data(collected_samples, args.output, HISTORY)
+        save_data(collected_samples, args.output, args.history_len)
 
         elapsed = time.time() - start_time
         m, s = divmod(int(elapsed), 60)
@@ -553,9 +545,11 @@ def save_data(samples: list, output_path: str, history_len: int = 5):
         "history_len": history_len,
         "description": (
             f"Success episode data for grasp_drill task. "
-            "full_obs is the policy observation vector (51-dim). "
+            f"full_obs is the policy observation vector "
+            f"({valid_samples[0]['full_obs'].shape[-1] if valid_samples else '?'}-dim, matches stage1). "
             f"Collected lenient_success=True. "
-            f"Stores state from SUCCESS_MINUS_{history_len} steps (captured before env.reset). "
+            f"Stores the LAST state at which success still held (cache refreshed every "
+            f"success step; history_len={history_len} extra backtrack). "
             "drill_pos is stored in LOCAL coordinates (relative to env_origin). "
             "joint_pos/vel are 13-dim controlled joints only (matching _get_observations)."
         ),

@@ -50,8 +50,14 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
     class Stage2Env(GraspDrillEnv):
         """
         Stage2: inherits all scene setup and observation logic from GraspDrillEnv.
-        Custom: _reset_idx (pkl sampling), _get_rewards, _get_dones.
+        Custom: _reset_idx (pkl sampling), _get_rewards, _get_dones,
+        _get_observations (stage1 obs + plate 位姿 7 维 pos+quat).
         """
+
+        # episode 级对齐成功判据:连续处于对齐区(dist<1cm ∧ angle<5°)≥ 该步数
+        # 即置位本局 sticky 成功标志(≈0.67s @30Hz)。写入 _cached_lenient_success,
+        # 供采集过滤 / deploy 统计 / failure stats 复用(与 stage1 同一接口)。
+        ALIGN_SUCCESS_HOLD = 20
 
         def __init__(
             self,
@@ -65,7 +71,10 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             # ── PKL dataset (before super().__init__) ───────────
             self.success_dataset = success_dataset
             self.debug = debug
-            cfg.observation_space = 57  # 51 (parent) + 3 (plate_pos_local) + 3 (plate_axis_angle) = 57
+            # 观测 = stage1 全部观测 + plate 位姿 7 维(pos_local 3 + quat wxyz 4)。
+            # plate 每回合随机 ±10cm/±10°,不进观测则目标不可见、任务不可解。
+            # 加载 stage1 checkpoint 时 train2.py 会对输入层做零填充扩展(自动按维度差)。
+            cfg.observation_space = int(cfg.observation_space) + 7
 
             if target_pos is not None:
                 cfg.target_pos = tuple(target_pos)
@@ -74,6 +83,12 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
 
             # ── Delegate ALL scene + obs setup to GraspDrillEnv ──
             super().__init__(cfg, debug=debug, **kwargs)
+
+            # 对齐成功追踪:连续保持计数 + 本局 sticky 标志
+            self._align_hold_steps = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device)
+            self._align_achieved = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device)
 
             # ── Target alignment (used in Stage2 rewards) ──────
             self._target_pos = torch.tensor(
@@ -144,6 +159,9 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             if hasattr(self, "_success_window_idx"):
                 self._success_window_idx[env_ids] = 0
                 self._success_window[env_ids] = False
+            if hasattr(self, "_align_hold_steps"):
+                self._align_hold_steps[env_ids] = 0
+                self._align_achieved[env_ids] = False
 
             # ── Statistics (mirrors GraspDrillEnv pattern) ──
             if len(env_ids) > 0:
@@ -287,8 +305,9 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 _flat_bmax[vid]               = vdata["body_mask_max"]
                 _flat_up[vid*3:(vid+1)*3]    = vdata["up_axis"]
                 _flat_scale[vid*3:(vid+1)*3]  = vdata["scale"]
-                _flat_pos[vid*3:(vid+1)*3]    = vdata["initial_pos"]
-                _flat_rot[vid*4:(vid+1)*4]    = vdata["initial_rot"]
+                # parent 现在存多位姿列表(initial_pos_list),fallback 取第一条基础位姿
+                _flat_pos[vid*3:(vid+1)*3]    = vdata["initial_pos_list"][0]
+                _flat_rot[vid*4:(vid+1)*4]    = vdata["initial_rot_list"][0]
 
             self._trigger1_offset[env_ids] = vid_oh @ _flat_toff.view(nv, 3)
             self._thumb_target_local[env_ids] = vid_oh @ _flat_thumb.view(nv, 3)
@@ -308,6 +327,16 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                     vid = variant_ids[i].item()
                     pool = self._pkl_by_variant.get(vid, [])
                     if not pool:
+                        # 没有该 variant 的成功样本:退回该 variant 的基础初始位姿,
+                        # 避免 drill_pos_world 保持零(电钻被放到 env 原点)。
+                        if not hasattr(self, "_warned_missing_pkl_variant"):
+                            self._warned_missing_pkl_variant = set()
+                        if vid not in self._warned_missing_pkl_variant:
+                            self._warned_missing_pkl_variant.add(vid)
+                            print(f"[WARN Stage2] pkl 中没有 variant {vid} 的样本,"
+                                  f"该 variant 将使用基础初始位姿(非抓取姿态)")
+                        drill_pos_world[i] = _flat_pos.view(nv, 3)[vid] + env_origins[i]
+                        drill_quat_world[i] = _flat_rot.view(nv, 4)[vid]
                         continue
                     sample = pool[np.random.randint(len(pool))]
 
@@ -368,64 +397,43 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 self._initial_link_body_dists = torch.zeros_like(link_dists)
             self._initial_link_body_dists[env_ids] = link_dists[env_ids].clone()
 
-            # ── Initial trigger → index-tip distance (penalize drift) ──
-            # Compute trigger world pos
-            variant_ids_reset = self._drill_variant_indices[env_ids].long()
-            trigger_offset_reset = torch.stack([
-                self._variant_attrs[vid.item()]["trigger_offset"] for vid in variant_ids_reset
-            ])
-            scale_reset = torch.stack([
-                self._variant_attrs[vid.item()]["scale"] for vid in variant_ids_reset
-            ])
-            scaled_trigger_reset = trigger_offset_reset * scale_reset
-            R_init = self._quat_to_rot_matrix(drill_quat_world)
-            trigger_world_init = drill_pos_world + (R_init @ scaled_trigger_reset.unsqueeze(-1)).squeeze(-1)
-
-            # Index tip world pos
-            body_names = self.franka.data.body_names
-            tip_name = "R_index_intermediate"
-            tip_pos_init = None
-            if tip_name in body_names:
-                tip_idx = body_names.index(tip_name)
-                tip_pos_init = self.franka.data.body_pos_w[env_ids, tip_idx, :]
-
-            if tip_pos_init is not None:
-                init_tip_trigger_dist = torch.norm(tip_pos_init - trigger_world_init, dim=1)  # [n]
-                # print(f"[Stage2 reset] env_ids={env_ids}, "
-                #       f"tip→trigger dist mean={init_tip_trigger_dist.mean().item()*100:.2f}cm  "
-                #       f"min={init_tip_trigger_dist.min().item()*100:.2f}cm  "
-                #       f"max={init_tip_trigger_dist.max().item()*100:.2f}cm")
-                if not hasattr(self, "_initial_tip_trigger_dist") or self._initial_tip_trigger_dist.shape[0] != self.num_envs:
-                    self._initial_tip_trigger_dist = torch.zeros(self.num_envs, device=self.device)
-                self._initial_tip_trigger_dist[env_ids] = init_tip_trigger_dist
+            # ── 指尖在电钻局部系中的初始位置(全手握姿漂移惩罚的基准) ──
+            # 在 franka 关节写入 pkl 姿态之后计算,基准 = 成功抓握时各指尖
+            # 相对电钻的位形;_get_rewards 每步用同一变换比较偏差。
+            tip_idx_init = self._get_fingertip_indices()
+            if tip_idx_init is not None:
+                tips_w_init = self.franka.data.body_pos_w[env_ids][:, tip_idx_init, :]  # [n, F, 3]
+                R_init = self._quat_to_rot_matrix(drill_quat_world)                     # [n, 3, 3]
+                rel_init = tips_w_init - drill_pos_world.unsqueeze(1)                   # [n, F, 3]
+                tips_local_init = torch.einsum(
+                    'nij,nfj->nfi', R_init.transpose(1, 2), rel_init)
+                if not hasattr(self, "_initial_tips_drill_local") or \
+                        self._initial_tips_drill_local.shape[0] != self.num_envs:
+                    self._initial_tips_drill_local = torch.zeros(
+                        self.num_envs, tips_local_init.shape[1], 3, device=self.device)
+                self._initial_tips_drill_local[env_ids] = tips_local_init
 
             # Debug: print initial min distance per env
             init_min_per_env = link_dists[env_ids].min(dim=1).values
 
 
         # ================================================================
-        # Observation override (parent + plate pos/axis-angle)
+        # Observation override: stage1 观测 + plate 位姿 6 维
         # ================================================================
 
         def _get_observations(self) -> dict:
-            # Delegate to parent for the base observation dict {"policy": [N, 51]}
             parent_obs_dict = super()._get_observations()
-            parent_obs = parent_obs_dict["policy"]  # [N, 51]
+            parent_obs = parent_obs_dict["policy"]
 
-            # Append plate position (relative to env origin) + axis-angle rotation (6 dims)
-            if self.plate is not None:
-                plate_pos_w = self.plate.data.root_pos_w          # [N, 3]
-                plate_quat_w = self.plate.data.root_quat_w         # [N, 4] (w,x,y,z)
-                env_origins = self.scene.env_origins               # [N, 3]
-                plate_pos_local = plate_pos_w - env_origins         # [N, 3]
-                plate_axis_angle = self._quat_to_axis_angle(plate_quat_w)  # [N, 3]
-                plate_obs = torch.cat([plate_pos_local, plate_axis_angle], dim=1)  # [N, 6]
+            plate = getattr(self, "plate", None)
+            if plate is not None:
+                plate_pos_local = plate.data.root_pos_w - self.scene.env_origins   # [N, 3]
+                plate_quat = plate.data.root_quat_w                                 # [N, 4] wxyz
+                plate_obs = torch.cat([plate_pos_local, plate_quat], dim=1)         # [N, 7]
             else:
-                plate_obs = torch.zeros(parent_obs.shape[0], 6, device=parent_obs.device)
+                plate_obs = torch.zeros(parent_obs.shape[0], 7, device=parent_obs.device)
 
-            observations = torch.cat([parent_obs, plate_obs], dim=1)  # [N, 57]
-            return {"policy": observations}
-
+            return {"policy": torch.cat([parent_obs, plate_obs], dim=1)}
 
         # ================================================================
         # Grasp success check
@@ -614,8 +622,31 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
 
 
 
+        # 握姿漂移惩罚追踪的指尖 body(缺失的自动跳过)
+        _FINGERTIP_BODIES = ("R_index_intermediate", "R_middle_intermediate",
+                             "R_ring_intermediate", "R_pinky_intermediate",
+                             "R_thumb_distal")
+
+        def _get_fingertip_indices(self):
+            """懒解析指尖 body 索引,返回 LongTensor 或 None(一个都没找到)。"""
+            if not hasattr(self, "_fingertip_body_idx"):
+                names = list(self.franka.data.body_names)
+                idx = [names.index(n) for n in self._FINGERTIP_BODIES if n in names]
+                if idx:
+                    self._fingertip_body_idx = torch.tensor(
+                        idx, dtype=torch.long, device=self.device)
+                    print(f"[Stage2] tip_drift 追踪 {len(idx)} 个指尖: "
+                          f"{[names[i] for i in idx]}")
+                else:
+                    self._fingertip_body_idx = None
+                    print("[WARN Stage2] 未找到任何指尖 body,tip_drift 惩罚关闭")
+            return self._fingertip_body_idx
+
         def _get_rewards(self) -> torch.Tensor:
-            """reward = w_grasp * binary_grasp + w_proximity * exp(-dist/0.05)."""
+            """reward = proximity(双尺度) + orientation(距离门控)
+            + success(成功区内每步 +30,持续给、不终止)
+            + tip_drift(全手指尖相对电钻位形漂移,单指 clamp 0.2m)
+            + plate_contact 惩罚(防撞板)。"""
             if self.debug:
                 try:
                     import isaacsim.util.debug_draw._debug_draw as omni_debug_draw
@@ -638,9 +669,9 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             xform1_rot = self._xform1_rot_cache    # [num_envs, 3, 3]
 
             dist = torch.norm(bit_pos - xform1_pos, dim=1)
-            r_proximity = torch.exp(-dist / 0.5)  # exp decay, half-life ~3.5cm
-
-            r_proximity = r_proximity * 20
+            # 双尺度:粗项(τ=0.5m)远处有引导,细项(τ=8cm)近处梯度陡。
+            # 上限仍 20,但远处"白拿"的基线减半,靠近的边际收益显著变大
+            r_proximity = 10.0 * torch.exp(-dist / 0.5) + 10.0 * torch.exp(-dist / 0.08)
             plate_x_axis = xform1_rot[:, :, 0]  # [N, 3]
             plate_y_axis = xform1_rot[:, :, 1]  # [N, 3]
             plate_z_axis = xform1_rot[:, :, 2]  # [N, 3]
@@ -698,37 +729,30 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
 
             angle_deg = torch.rad2deg(angle)
             success_mask = (dist < 0.01) & (angle_deg < 5.0)
-            r_success = success_mask.float() * 300
+            # 成功区内每步 +30,持续给、不终止(鼓励保持对齐到超时)
+            r_success = success_mask.float() * 30.0
             reward = reward + r_success
 
-            # ── Penalty: trigger → index-tip distance drift ──
-            # If tip drifted away from trigger compared to initial grasp pose, penalize.
-            body_names = self.franka.data.body_names
-            tip_name = "R_index_intermediate"
-            cur_tip_trigger_dist = None
-            if tip_name in body_names:
-                # Compute current trigger world pos (same as in _check_grasp_success)
-                drill_pos = self.drill.data.root_pos_w
-                drill_quat = self.drill.data.root_quat_w
-                variant_ids = self._drill_variant_indices.long()
-                trigger_offset = torch.stack([
-                    self._variant_attrs[vid.item()]["trigger_offset"] for vid in variant_ids
-                ])
-                scale = torch.stack([
-                    self._variant_attrs[vid.item()]["scale"] for vid in variant_ids
-                ])
-                scaled_trigger = trigger_offset * scale
-                R = self._quat_to_rot_matrix(drill_quat)
-                trigger_world = drill_pos + (R @ scaled_trigger.unsqueeze(-1)).squeeze(-1)
+            # episode 级成功标志:连续保持 ALIGN_SUCCESS_HOLD 步 → sticky 置位
+            # (只用于成功判定/数据过滤,不参与 reward)
+            self._align_hold_steps = torch.where(
+                success_mask,
+                self._align_hold_steps + 1,
+                torch.zeros_like(self._align_hold_steps))
+            self._align_achieved |= self._align_hold_steps >= self.ALIGN_SUCCESS_HOLD
 
-                tip_idx = body_names.index(tip_name)
-                tip_pos_now = self.franka.data.body_pos_w[:, tip_idx, :]
-                cur_tip_trigger_dist = torch.norm(tip_pos_now - trigger_world, dim=1)  # [N]
-                abs_delta = torch.abs(cur_tip_trigger_dist - self._initial_tip_trigger_dist)  # [N]
-                self._r_tip_drift = abs_delta * (-100.0)  # penalize only when > initial
+            self._r_tip_drift = None
+            mean_tip_dev = None
+            tip_idx = self._get_fingertip_indices()
+            if tip_idx is not None and hasattr(self, "_initial_tips_drill_local"):
+                drill_pos = self.drill.data.root_pos_w
+                tips_w = self.franka.data.body_pos_w[:, tip_idx, :]                # [N, F, 3]
+                rel = tips_w - drill_pos.unsqueeze(1)                              # [N, F, 3]
+                tips_local = torch.einsum('nij,nfj->nfi', R_drill.transpose(1, 2), rel)
+                dev = torch.norm(tips_local - self._initial_tips_drill_local, dim=2)  # [N, F]
+                mean_tip_dev = dev.clamp(max=0.2).mean(dim=1)                      # [N]
+                self._r_tip_drift = mean_tip_dev * (-100.0)
                 reward = reward + self._r_tip_drift
-            else:
-                self._r_tip_drift = None
 
             # ── Penalty: drill-plate collision via contact sensor ─
             contact_force = None
@@ -750,7 +774,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 for i in range(min(3, self.num_envs)):
                     r_prox_raw = torch.exp(-dist[i] / 0.05).item()
                     r_orient_raw = r_align[i].item()
-                    tip_dist_str = f"  tip_dist={cur_tip_trigger_dist[i].item():.4f}m" if cur_tip_trigger_dist is not None else ""
+                    tip_dist_str = f"  tip_dev={mean_tip_dev[i].item():.4f}m" if mean_tip_dev is not None else ""
                     bit_dist_str = f"  bit_xform1_dist={dist[i].item():.4f}m"
                     contact_str = f"  plate_contact={self._r_plate_contact[i].item():.2f}" if getattr(self, "_r_plate_contact", None) is not None else ""
                     print(f"[DEBUG reward #{_step}] env_{i}  "
@@ -769,6 +793,11 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             for name, tensor in self._reward_components.items():
                 if tensor is not None and tensor.numel() > 0:
                     self.extras["log"][f"reward_{name}"] = tensor.mean()
+            # 对齐成功监控:瞬时对齐比例 + episode 级滚动成功率(sticky 判据)
+            self.extras["log"]["align_rate_now"] = success_mask.float().mean()
+            if getattr(self, "_recent_filled", 0) > 0:
+                self.extras["log"]["success_rate_recent"] = \
+                    self._recent_success[:self._recent_filled].float().mean().item()
 
             if self.debug:
                 try:
@@ -845,6 +874,11 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             init_max = self._initial_link_body_dists.min(dim=1).values  # [num_envs]
             dist_delta = cur_max - init_max
             drop = dist_delta > 0.05
+
+            # episode 级成功 = 曾稳定对齐(sticky)且本步没有掉钻。
+            # 写入与 stage1 相同的接口,采集过滤 / deploy 统计 / _reset_idx 的
+            # failure stats 与 recent success rate 追踪均无需改动即可复用。
+            self._cached_lenient_success = self._align_achieved & ~drop
 
             # if not hasattr(self, "_done_log_counter"):
             #     self._done_log_counter = 0
@@ -1170,6 +1204,9 @@ def create_stage2_env_cfg(
         headless=headless,
         debug=debug,
         drill_variants_path=drill_variants_path,
+        # stage2 是纯 RL(状态观测),不需要相机;默认 True 会 spawn TiledCamera,
+        # 没开 --enable_cameras 的 App 会在 sim.reset() 时直接崩,且开渲染极耗显存。
+        enable_cameras=False,
     )
 
     # ── Register plate to scene ──────────────────────────────

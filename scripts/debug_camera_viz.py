@@ -14,7 +14,7 @@ import time
 import numpy as np
 import torch
 
-project_root = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
 sys.path.insert(0, project_root)
 
 
@@ -124,12 +124,10 @@ def main():
             enable_cameras=True,
         )
         # Add rgb data type for visualization (doesn't affect trained policy)
-        if hasattr(cfg.scene, "cam1") and cfg.scene.cam1 is not None:
-            if "rgb" not in cfg.scene.cam1.data_types:
-                cfg.scene.cam1.data_types = ["rgb"] + list(cfg.scene.cam1.data_types)
-        if hasattr(cfg.scene, "cam2") and cfg.scene.cam2 is not None:
-            if "rgb" not in cfg.scene.cam2.data_types:
-                cfg.scene.cam2.data_types = ["rgb"] + list(cfg.scene.cam2.data_types)
+        for _cn in ("cam1", "cam2"):   # cam1=30cm跟随 cam2=固定工作区,两个都要 RGB
+            _c = getattr(cfg.scene, _cn, None)
+            if _c is not None and "rgb" not in _c.data_types:
+                _c.data_types = ["rgb"] + list(_c.data_types)
         cfg.seed = args.seed
         cfg.log_dir = os.path.dirname(os.path.dirname(args.checkpoint))
 
@@ -168,14 +166,14 @@ def main():
 
         scene_keys = list(env_unwrapped.scene.keys())
         print(f"[INFO] Available scene keys: {scene_keys}")
-        if "cam1" not in scene_keys or "cam2" not in scene_keys:
-            print("[ERROR] Cameras not found in scene.")
-            print(f"[ERROR] Available keys: {scene_keys}")
-            return
+        for _cn in ("cam1", "cam2"):
+            if _cn not in scene_keys:
+                print(f"[ERROR] Camera '{_cn}' not found in scene. Available: {scene_keys}")
+                return
 
-        cam1 = env_unwrapped.scene["cam1"]
-        cam2 = env_unwrapped.scene["cam2"]
-        print("[INFO] Cameras found successfully.")
+        cam1 = env_unwrapped.scene["cam1"]   # 30cm 跟随电钻
+        cam2 = env_unwrapped.scene["cam2"]   # 固定工作区
+        print("[INFO] Cameras cam1 + cam2 found successfully.")
 
         dt = env_unwrapped.step_dt
         settings = carb.settings.get_settings()
@@ -223,8 +221,8 @@ def main():
             cam2.update(dt)
 
             rgb1 = cam1.data.output["rgb"][0].detach().cpu().numpy().astype(np.uint8)
-            rgb2 = cam2.data.output["rgb"][0].detach().cpu().numpy().astype(np.uint8)
             depth1 = cam1.data.output["distance_to_image_plane"][0]
+            rgb2 = cam2.data.output["rgb"][0].detach().cpu().numpy().astype(np.uint8)
             depth2 = cam2.data.output["distance_to_image_plane"][0]
 
             if step_count % args.log_interval == 0:
@@ -235,17 +233,17 @@ def main():
                 print(
                     f"  Cam1 RGB: shape={rgb1.shape}, range=[{rgb1.min()}, {rgb1.max()}], mean={rgb1.mean():.1f}"
                 )
+                print(f"  Cam1 Depth: {describe_depth(depth1)}")
                 print(
                     f"  Cam2 RGB: shape={rgb2.shape}, range=[{rgb2.min()}, {rgb2.max()}], mean={rgb2.mean():.1f}"
                 )
-                print(f"  Cam1 Depth: {describe_depth(depth1)}")
                 print(f"  Cam2 Depth: {describe_depth(depth2)}")
                 last_log_time = now
 
             if args.save_images and step_count % args.save_interval == 0:
                 save_rgb_image(os.path.join(output_dir, f"cam1_step_{step_count:06d}.png"), rgb1)
                 save_rgb_image(os.path.join(output_dir, f"cam2_step_{step_count:06d}.png"), rgb2)
-                print(f"  [INFO] Saved images for step {step_count} to {output_dir}")
+                print(f"  [INFO] Saved cam1 + cam2 images for step {step_count} to {output_dir}")
 
             obs, rewards, dones, _ = env.step(actions)
             step_count += 1

@@ -14,9 +14,6 @@ logger = logging.getLogger(__name__)
 class RewardHyperparameters:
     """奖励函数超参数 - 参考 RobustDexGrasp 设计"""
 
-    # === 接近奖励（手指奖励 + 手掌惩罚）===
-    # 手指奖励: reward = scale * exp(-distance / temp)  [近→大，远→小]
-    # 手掌惩罚: penalty = scale * (distance / temp)     [近→小，远→大]
 
     finger_reward_scale: float = 3.0      # 手指奖励最大值
     finger_temperature: float = 0.05      # 手指温度参数（5cm 内奖励明显）
@@ -48,6 +45,7 @@ class RewardHyperparameters:
 
 
 
+
 @dataclass
 class TerminationHyperparameters:
     """终止条件超参数"""
@@ -66,7 +64,6 @@ class ActionHyperparameters:
     wrist_euler_scale: float = 0.05    # 手腕姿态每次变化（弧度）
     joint_pos_scale: float = 0.85      # 关节位置每次变化（弧度，action -1~1 覆盖整个关节范围）
 
-    # 动作惩罚（鼓励平滑控制）
     action_penalty_weight: float = -0.0002  # 负权重 = 惩罚
     action_penalty_scale: float = 0.0002    # 惩罚缩放因子
 
@@ -76,8 +73,8 @@ class SimulationHyperparameters:
     """仿真超参数"""
 
     dt: float = 1/120
-    decimation: int = 2  # 实时仿真用，降低控制频率以达到实时
-    episode_length_s: float = 10.0  # 每集最大时长（秒）
+    decimation: int = 4 
+    episode_length_s: float = 10.0  
 
     # PhysX 参数o
     bounce_threshold_velocity: float = 0.01
@@ -126,15 +123,15 @@ class DrillHyperparameters:
 
     contact_offset: float = 0.005
     rest_offset: float = 0
-    max_depenetration_velocity: float = 10
+    max_depenetration_velocity: float = 10.0  # 限制穿透解算瞬间甩出的速度（原 10 偏大）
 
     table_height: float = 0.6
 
     # 求解器参数
     solver_position_iteration_count: int = 64  #
     solver_velocity_iteration_count: int = 1  #
-    max_angular_velocity: float = 1000.0
-    max_linear_velocity: float = 1000.0
+    max_angular_velocity: float = 50.0   # 原 1000 形同不限；钻头正常运动远低于此
+    max_linear_velocity: float = 10.0     # 原 1000；被打飞也不该超过 ~10 m/s
 
 
 @dataclass
@@ -150,18 +147,30 @@ class RandomizationHyperparameters:
 
     enable_randomization: bool = True
 
-    joint_pos_noise_std: float = 0.002  # 关节位置噪声标准差
-    joint_vel_noise_std: float = 0.001  # 关节速度噪声标准差
+    joint_pos_noise_std: float = 0.002  
+    joint_vel_noise_std: float = 0.001 
 
-    action_noise_std: float = 0.05  # 动作噪声标准差
+    action_noise_std: float = 0.05  
 
-    drill_pos_random_range: Tuple[float, float, float] = (0.1, 0.15, 0.00) 
-    drill_rot_random_range: Tuple[float, float, float] = (0, 0, 2)  
+    drill_pos_random_range: Tuple[float, float, float] = (0.05, 0.05, 0.00) 
+    drill_rot_random_range: Tuple[float, float, float] = (0, 0, 1)  
 
     gravity_bias_range: Tuple[float, float, float] = (0.0, 0.0, 0.4)  
 
-    friction_random_range: Tuple[float, float] = (0.5, 1.5)  
-    mass_random_range: Tuple[float, float] = (0.7, 1.3)  
+    friction_random_range: Tuple[float, float] = (0.5, 1.5)
+    mass_random_range: Tuple[float, float] = (0.7, 1.3)
+
+
+@dataclass
+class PerceptionHyperparameters:
+    workspace: Tuple[float, float, float, float, float, float] = (0.25, 1.75, -0.55, 0.95, 0.025, 2.0)
+    ground_z: float = 0.02
+    ground_points: int = 96  
+    ground_xy_noise_std: float = 0.02
+    camera_follow_drill: bool = False
+    drill_crop_half: float = 0.2
+    img_height: int = 256
+    img_width: int = 256
 
 
 @dataclass
@@ -175,6 +184,7 @@ class AllHyperparameters:
     drill: DrillHyperparameters = None
     scene: SceneHyperparameters = None
     randomization: RandomizationHyperparameters = None
+    perception: PerceptionHyperparameters = None
     debug: bool = True  # 调试模式开关
 
     def __post_init__(self):
@@ -195,97 +205,13 @@ class AllHyperparameters:
             self.scene = SceneHyperparameters()
         if self.randomization is None:
             self.randomization = RandomizationHyperparameters()
+        if self.perception is None:
+            self.perception = PerceptionHyperparameters()
 
 
 # 默认超参数实例
 DEFAULT_HYPERPARAMETERS = AllHyperparameters()
 
-
-# ========================================
-# 配置验证函数
-# ========================================
-
-# def validate_hyperparameters(hp: AllHyperparameters) -> bool:
-#     """
-#     验证超参数的有效性
-
-#     Args:
-#         hp: 超参数对象
-
-#     Returns:
-#         bool: 验证是否通过
-#     """
-#     errors = []
-
-#     if hp.reward.distance_reward_weight < 0:
-#         errors.append("distance_reward_weight 不能为负")
-#     if hp.reward.distance_reward_weight > 100:
-#         errors.append("distance_reward_weight 过大，建议 < 100")
-#     if hp.reward.lift_reward_weight < 0:
-#         errors.append("lift_reward_weight 不能为负")
-#     if hp.reward.success_reward_weight < 0:
-#         errors.append("success_reward_weight 不能为负")
-#     if hp.reward.lift_height <= 0:
-#         errors.append("lift_height 必须为正")
-#     if hp.reward.dist_reward_scale <= 0:
-#         errors.append("dist_reward_scale 必须为正")
-
-#     if hp.action.wrist_pos_scale < 0:
-#         errors.append("wrist_pos_scale 不能为负")
-#     if hp.action.wrist_euler_scale < 0:
-#         errors.append("wrist_euler_scale 不能为负")
-#     if hp.action.joint_pos_scale < 0:
-#         errors.append("joint_pos_scale 不能为负")
-
-#     # 验证仿真参数
-#     if hp.simulation.dt <= 0:
-#         errors.append("dt 必须为正")
-#     if hp.simulation.dt > 0.1:
-#         errors.append("dt 过大，建议 < 0.1")
-#     if hp.simulation.decimation < 1:
-#         errors.append("decimation 必须 >= 1")
-#     if hp.simulation.episode_length_s <= 0:
-#         errors.append("episode_length_s 必须为正")
-
-#     # 验证终止条件参数
-#     if hp.termination.lift_z_threshold <= 0:
-#         errors.append("lift_z_threshold 必须为正")
-#     if hp.termination.fall_dist < 0:
-#         errors.append("fall_dist 不能为负")
-
-#     # 验证手部参数
-#     if hp.hand.stiffness < 0:
-#         errors.append("stiffness 不能为负")
-#     if hp.hand.damping < 0:
-#         errors.append("damping 不能为负")
-
-#     # 验证电钻参数
-#     if hp.drill.mass <= 0:
-#         errors.append("mass 必须为正")
-#     if hp.drill.contact_offset < 0:
-#         errors.append("contact_offset 不能为负")
-#     if hp.drill.rest_offset < 0:
-#         errors.append("rest_offset 不能为负")
-#     if hp.drill.contact_offset < hp.drill.rest_offset:
-#         errors.append("contact_offset 应该 >= rest_offset，否则可能导致接触不稳定")
-
-#     # 验证场景参数
-#     if hp.scene.env_spacing < 0:
-#         errors.append("env_spacing 不能为负")
-
-#     # 报告结果
-#     if errors:
-#         logger.error("超参数验证失败：")
-#         for error in errors:
-#             logger.error(f"  - {error}")
-#         return False
-#     else:
-#         logger.info("超参数验证通过 ✓")
-#         return True
-
-
-# def validate_and_log_hyperparameters(hp: AllHyperparameters) -> None:
-#     validate_hyperparameters(hp)
 
 
 def create_hyperparameters_from_config(config: dict) -> AllHyperparameters:
