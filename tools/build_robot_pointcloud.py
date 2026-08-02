@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""一次性离线 builder:从 URDF 采样每个 link 的表面点(link 局部坐标系),存成 .npz。
+"""One-off offline builder: sample surface points of each link from URDF (link-local frame),
+save as .npz.
 
-输出 {link_name: (Ki,3) float32},供运行时模块 robot_pointcloud.py 用 FK 变换成
-完整机器人点云。采集(collect_dp3_data.py)和部署(deploy_dp3_sim.py / 真机)共用同一份
-canonical 点 → sim 真机几何一致、零域 gap。
+Outputs {link_name: (Ki,3) float32}, consumed by the runtime module robot_pointcloud.py to
+FK-transform into a full robot point cloud. Collection (collect_dp3_data.py) and deployment
+(deploy_dp3_sim.py / real robot) share the same canonical points -> sim/real geometry identical,
+zero domain gap.
 
-只在改了机器人 URDF/mesh 时才需要重跑。运行时不依赖 trimesh。
+Only needs re-running when the robot URDF/mesh changes. Runtime does not depend on trimesh.
 
-用法:
+Usage:
   python tools/build_robot_pointcloud.py \
       --urdf assets/inspire_tac/fr3_inspire_hand_right.urdf \
       --out  assets/inspire_tac/robot_canonical_points.npz \
@@ -22,7 +24,7 @@ import trimesh
 
 
 def rpy_to_mat(rpy):
-    """URDF fixed-axis roll-pitch-yaw -> 3x3 旋转矩阵 (R = Rz·Ry·Rx)。"""
+    """URDF fixed-axis roll-pitch-yaw -> 3x3 rotation matrix (R = Rz.Ry.Rx)."""
     r, p, y = rpy
     cr, sr = np.cos(r), np.sin(r)
     cp, sp = np.cos(p), np.sin(p)
@@ -41,7 +43,7 @@ def _floats(s, n, default):
 
 
 def load_visual_mesh(geom, urdf_dir):
-    """把一个 <geometry> 转成 trimesh.Trimesh(mesh / box / cylinder / sphere)。"""
+    """Convert one <geometry> to a trimesh.Trimesh (mesh / box / cylinder / sphere)."""
     mesh = geom.find("mesh")
     if mesh is not None:
         fn = mesh.get("filename").replace("package://", "")
@@ -68,13 +70,14 @@ def load_visual_mesh(geom, urdf_dir):
 
 
 def _is_hand_link(name):
-    """手部/末端 link(抓取与接触的关键):上权重,别被大块手臂淹没。"""
+    """Hand / end-effector link (key for grasp and contact): upweight so it is not drowned by the big arm."""
     n = name.lower()
     return n.startswith("r_") or "hand" in n or "flange" in n
 
 
 def _alloc_group(entries, budget, min_per_visual, rng, name_to_idx, link_names):
-    """从一组 entries(同属手/臂)采样并精确修整到 budget 个点;组内按面积比例分配。"""
+    """Sample from a group of entries (all hand or all arm) and trim exactly to budget points;
+    within the group, allocate proportionally to area."""
     if budget <= 0 or not entries:
         return np.zeros((0, 3), np.float32), np.zeros((0,), np.int64)
     tot = sum(e[4] for e in entries) or 1.0
@@ -82,7 +85,7 @@ def _alloc_group(entries, budget, min_per_visual, rng, name_to_idx, link_names):
     for lname, m, R, t, warea in entries:
         k = max(min_per_visual, int(round(budget * warea / tot)))
         pts, _ = trimesh.sample.sample_surface(m, k)
-        pts = (pts @ R.T + t).astype(np.float32)              # mesh 系 -> link 系
+        pts = (pts @ R.T + t).astype(np.float32)              # mesh frame -> link frame
         if lname not in name_to_idx:
             name_to_idx[lname] = len(link_names)
             link_names.append(lname)
@@ -90,7 +93,7 @@ def _alloc_group(entries, budget, min_per_visual, rng, name_to_idx, link_names):
         idx_all.append(np.full(len(pts), name_to_idx[lname], dtype=np.int64))
     P = np.concatenate(pts_all, axis=0)
     I = np.concatenate(idx_all, axis=0)
-    sel = rng.choice(len(P), budget, replace=(len(P) < budget))   # 精确到 budget
+    sel = rng.choice(len(P), budget, replace=(len(P) < budget))   # exact to budget
     return P[sel], I[sel]
 
 
@@ -98,15 +101,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--urdf", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--total_points", type=int, default=512,
-                    help="最终固定点数(运行时直接 FK 变换这些点,无需再采样)")
-    ap.add_argument("--hand_weight", type=float, default=4.0,
-                    help="手部 link 的点数权重(相对手臂),保证抓取/接触区域够密")
-    ap.add_argument("--hand_points", type=int, default=None,
-                    help="手部 link 的精确总点数;与 --arm_points 一起给时启用分组精确分配"
-                         "(覆盖 total_points/hand_weight)")
-    ap.add_argument("--arm_points", type=int, default=None,
-                    help="手臂 link 的精确总点数(与 --hand_points 一起用)")
+    ap.add_argument("--total_points", type=int, default=512)
+    ap.add_argument("--hand_weight", type=float, default=4.0)
+    ap.add_argument("--hand_points", type=int, default=None)
+    ap.add_argument("--arm_points", type=int, default=None)
     ap.add_argument("--min_per_visual", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -115,7 +113,7 @@ def main():
     urdf_dir = os.path.dirname(os.path.abspath(args.urdf))
     root = ET.parse(args.urdf).getroot()
 
-    # ---- 第一遍:载入每个 visual 的 mesh,算 加权面积(= 面积 × 手部权重)----
+    # ---- pass 1: load each visual's mesh, compute weighted area (= area x hand weight) ----
     entries = []  # (link_name, mesh, R, t, weighted_area)
     for link in root.findall("link"):
         lname = link.get("name")
@@ -134,12 +132,12 @@ def main():
 
     total_warea = sum(e[4] for e in entries) or 1.0
 
-    # ---- 第二遍:采样 + 变换到 link 系 ----
-    link_names = []                       # 唯一 link 顺序
+    # ---- pass 2: sample + transform to link frame ----
+    link_names = []                       # unique link order
     name_to_idx = {}
     explicit = args.hand_points is not None and args.arm_points is not None
     if explicit:
-        # 手/臂分组精确分配:手 = hand_points,臂 = arm_points(各自组内按面积比例)
+        # hand/arm grouped exact allocation: hand = hand_points, arm = arm_points (each by area within group)
         hand_e = [e for e in entries if _is_hand_link(e[0])]
         arm_e = [e for e in entries if not _is_hand_link(e[0])]
         hp, hi = _alloc_group(hand_e, args.hand_points, args.min_per_visual, rng, name_to_idx, link_names)
@@ -147,12 +145,12 @@ def main():
         points = np.concatenate([hp, ap_], axis=0)
         link_idx = np.concatenate([hi, ai], axis=0)
     else:
-        # 旧路径:按加权面积分配固定 total_points
+        # legacy path: allocate fixed total_points by weighted area
         pts_all, idx_all = [], []
         for lname, m, R, t, warea in entries:
             k = max(args.min_per_visual, int(round(args.total_points * warea / total_warea)))
             pts, _ = trimesh.sample.sample_surface(m, k)
-            pts = (pts @ R.T + t).astype(np.float32)          # mesh 系 -> link 系
+            pts = (pts @ R.T + t).astype(np.float32)          # mesh frame -> link frame
             if lname not in name_to_idx:
                 name_to_idx[lname] = len(link_names)
                 link_names.append(lname)
@@ -166,8 +164,8 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     np.savez(args.out,
-             points=points,                                   # (M,3) 各自 link 系
-             link_idx=link_idx,                               # (M,) 指向 link_names
+             points=points,                                   # (M,3) each in its link frame
+             link_idx=link_idx,                               # (M,) index into link_names
              link_names=np.array(link_names))                 # (L,)
 
     print(f"[OK] {len(link_names)} links, {len(points)} points -> {args.out}")

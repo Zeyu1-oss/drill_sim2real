@@ -1,11 +1,11 @@
 """
-Stage2 抓取-操作电钻环境
+Stage2 grasp-manipulate drill environment
 
-与 grasp_drill_env.py 的区别：
-1. 初始姿态从数据集加载（而非随机生成）
-2. 新增 trigger 按压奖励、倾斜惩罚等专属 reward
-3. 新增操作相关的终止条件
-4. 预留操作板（operating_board）
+Differences from grasp_drill_env.py:
+1. initial pose loaded from a dataset (instead of random)
+2. adds dedicated rewards: trigger-press reward, tilt penalty, etc.
+3. adds manipulation-related termination conditions
+4. reserves an operating board (operating_board)
 """
 
 import torch
@@ -20,7 +20,7 @@ from .grasp_drill_env import (
 )
 
 # =============================================================================
-# Stage2 专属 Scene 配置：必须单独定义子类才能加字段
+# Stage2-specific Scene config: must define a subclass to add fields
 # =============================================================================
 try:
     from isaaclab.utils import configclass
@@ -32,12 +32,12 @@ except ImportError:
 
 @configclass
 class Stage2SceneCfg(GraspDrillSceneCfg):
-    """Stage2 专属 scene：预声明 operating_board"""
+    """Stage2-specific scene: pre-declare operating_board"""
     operating_board: AssetBaseCfg = MISSING
 
 
 # =============================================================================
-# 环境配置
+# env config
 # =============================================================================
 
 def create_stage2_env_cfg(
@@ -49,7 +49,7 @@ def create_stage2_env_cfg(
     debug: bool = False,
     dataset_path: str = None,
 ) -> GraspDrillEnvCfg:
-    """创建 Stage2 环境配置"""
+    """Create the Stage2 env config"""
     cfg = _create_grasp_drill_env_cfg(
         num_envs=num_envs,
         device=device,
@@ -60,7 +60,7 @@ def create_stage2_env_cfg(
     )
     cfg.dataset_path = dataset_path
 
-    # 操作板配置
+    # operating board config
     try:
         from isaaclab.assets import AssetBaseCfg
         from isaaclab.sim import CuboidCfg, PreviewSurfaceCfg, CollisionPropertiesCfg, RigidBodyPropertiesCfg, MassPropertiesCfg
@@ -91,7 +91,7 @@ def create_stage2_env_cfg(
         init_state=AssetBaseCfg.InitialStateCfg(pos=_BOARD_POS),
     )
 
-    # 用 Stage2SceneCfg（带 operating_board）替换 scene
+    # replace scene with Stage2SceneCfg (with operating_board)
     cfg.scene = Stage2SceneCfg(
         num_envs=num_envs,
         env_spacing=cfg.scene.env_spacing,
@@ -107,16 +107,16 @@ def create_stage2_env_cfg(
 
 
 # =============================================================================
-# 环境类
+# env class
 # =============================================================================
 
 class GraspDrillStage2Env(GraspDrillEnv):
-    """Stage2 环境：加载抓取姿态数据，专注于操作任务"""
+    """Stage2 env: load grasp-pose data, focus on the manipulation task"""
 
-    # === 操作板配置（用户提供后填入）===
-    # TODO: 填入实际 USD 路径和坐标
+    # === operating board config (fill in once provided) ===
+    # TODO: fill in the actual USD path and coordinates
     OPERATING_BOARD_USD = None   # "path/to/operating_board.usd"
-    OPERATING_BOARD_POS = (0.0, 0.0, 0.0)  # (x, y, z) 世界坐标
+    OPERATING_BOARD_POS = (0.0, 0.0, 0.0)  # (x, y, z) world coordinates
     OPERATING_BOARD_SCALE = (1.0, 1.0, 1.0)
 
     def __init__(self, cfg: GraspDrillEnvCfg, render_mode: str = None, debug: bool = False, **kwargs):
@@ -124,12 +124,12 @@ class GraspDrillStage2Env(GraspDrillEnv):
         self._stage2_dataset_path = getattr(cfg, 'dataset_path', None)
         super().__init__(cfg, render_mode=render_mode, debug=debug, **kwargs)
 
-        # 操作板引用
+        # operating board reference
         self.operating_board = self.scene["operating_board"] if "operating_board" in self.scene else None
 
-        # === Stage2 状态 ===
+        # === Stage2 state ===
         self._trigger_pressed_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._trigger_press_threshold = 15  # 连续按压 15 步判定为成功按压
+        self._trigger_press_threshold = 15  # 15 consecutive press steps count as a successful press
 
         self._drill_orientation_buffer_size = 20
         self._drill_orientation_buffer = torch.zeros(
@@ -140,7 +140,7 @@ class GraspDrillStage2Env(GraspDrillEnv):
         self._drill_orientation_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
     # -------------------------------------------------------------------------
-    # 问题1修复：覆写 _get_rewards 和 _get_dones（不重写 step()）
+    # fix 1: override _get_rewards and _get_dones (do not rewrite step())
     # -------------------------------------------------------------------------
     def _get_rewards(self):
         return self._get_stage2_rewards()
@@ -149,13 +149,13 @@ class GraspDrillStage2Env(GraspDrillEnv):
         return self._get_stage2_dones()
 
     # -------------------------------------------------------------------------
-    # 问题3修复：_reset_idx 顺序
-    # super()._reset_idx() 已经写入 drill/franka 默认状态（含 env_origins）
-    # 数据集位姿是世界坐标，直接覆盖，不加 env_origins
-    # joint_pos 维度匹配：数据集保存的是 franka.data.joint_pos（全部关节 DOF）
+    # fix 3: _reset_idx order
+    # super()._reset_idx() already wrote the drill/franka default state (including env_origins)
+    # dataset poses are world coordinates, overwrite directly, do not add env_origins
+    # joint_pos dim match: the dataset stores franka.data.joint_pos (all joint DOFs)
     # -------------------------------------------------------------------------
     def _reset_idx(self, env_ids: torch.Tensor):
-        super()._reset_idx(env_ids)  # 先写入默认状态
+        super()._reset_idx(env_ids)  # write default state first
 
         if self._stage2_dataset is None and self._stage2_dataset_path:
             self.load_dataset(self._stage2_dataset_path)
@@ -180,7 +180,7 @@ class GraspDrillStage2Env(GraspDrillEnv):
 
         n = len(env_ids)
 
-        # --- 覆盖 drill 状态（世界坐标）---
+        # --- override drill state (world coordinates) ---
         if drill_pos is not None:
             drill_root_state = self.drill.data.default_root_state[env_ids].clone()
             drill_root_state[:, 0:3] = drill_pos.unsqueeze(0).expand(n, -1)
@@ -192,7 +192,7 @@ class GraspDrillStage2Env(GraspDrillEnv):
             self.initial_drill_pos[env_ids] = drill_root_state[:, :3].clone()
             self.drill_initial_rot_tensor[env_ids] = drill_root_state[:, 3:7].clone()
 
-        # --- 覆盖机械臂关节状态（数据集保存的是全部关节，维度匹配）---
+        # --- override arm joint state (dataset stores all joints, dims match) ---
         if joint_pos is not None:
             franka_joint_pos = self.franka.data.joint_pos.clone()
             franka_joint_vel = self.franka.data.joint_vel.clone()
@@ -203,26 +203,26 @@ class GraspDrillStage2Env(GraspDrillEnv):
                 self.cur_targets[env_ids] = joint_pos.unsqueeze(0).expand(n, -1)[:, self.controlled_joint_indices]
                 self.prev_targets[env_ids] = joint_pos.unsqueeze(0).expand(n, -1)[:, self.controlled_joint_indices]
 
-        # --- 重置 Stage2 状态 ---
+        # --- reset Stage2 state ---
         self._trigger_pressed_steps[env_ids] = 0
         self._drill_orientation_buffer[env_ids] = 0.0
         self._drill_orientation_idx[env_ids] = 0
 
     # -------------------------------------------------------------------------
-    # 以下原有逻辑不变
+    # the logic below is unchanged
     # -------------------------------------------------------------------------
     def _check_grasp_success(self) -> torch.Tensor:
         return self._check_success()
 
     def load_dataset(self, dataset_path: str):
-        """加载姿态数据集"""
+        """Load the pose dataset"""
         import pickle
         with open(dataset_path, 'rb') as f:
             self._stage2_dataset = pickle.load(f)
-        print(f"[Stage2] 已加载数据集: {dataset_path}, 包含 {len(self._stage2_dataset)} 个样本")
+        print(f"[Stage2] loaded dataset: {dataset_path}, containing {len(self._stage2_dataset)} samples")
 
     def _check_trigger_pressed(self) -> torch.Tensor:
-        """检查 trigger 是否被按下：R_index_intermediate 在 trigger 附近 < 2cm"""
+        """Check whether the trigger is pressed: R_index_intermediate within < 2cm of the trigger"""
         drill_pos = self.drill.data.root_pos_w
         drill_quat = self.drill.data.root_quat_w
         body_names = self.franka.data.body_names
@@ -261,32 +261,32 @@ class GraspDrillStage2Env(GraspDrillEnv):
         return dist < 0.02
 
     def _get_drill_uprightness(self) -> torch.Tensor:
-        """计算电钻朝上程度：Y 轴与世界 Z 轴的夹角余弦"""
+        """Compute how upward the drill points: cosine of the angle between its Y axis and world Z axis"""
         drill_quat = self.drill.data.root_quat_w
         qw, qx, qy, qz = drill_quat[:, 0], drill_quat[:, 1], drill_quat[:, 2], drill_quat[:, 3]
         upright = 2.0 * (qy * qz + qw * qx)
         return torch.clamp(upright, -1.0, 1.0)
 
     def _update_orientation_buffer(self):
-        """更新电钻朝向的滑动窗口"""
+        """Update the sliding window of drill orientation"""
         upright = self._get_drill_uprightness()
         idx = self._drill_orientation_idx.long()
         self._drill_orientation_buffer.scatter_(1, idx.unsqueeze(1), upright.unsqueeze(1))
         self._drill_orientation_idx = (self._drill_orientation_idx + 1) % self._drill_orientation_buffer_size
 
     # -------------------------------------------------------------------------
-    # 问题3修复：_get_stage2_rewards 写入 extras["log"]（TensorBoard）
+    # fix 3: _get_stage2_rewards writes to extras["log"] (TensorBoard)
     # -------------------------------------------------------------------------
     def _get_stage2_rewards(self) -> torch.Tensor:
-        """Stage2 专属奖励函数"""
+        """Stage2-specific reward function"""
         total_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
-        # === 0. 维持抓取成功奖励 ===
+        # === 0. maintain grasp success reward ===
         grasp_success = self._check_success()
         grasp_reward = grasp_success.float() * 50.0
         total_reward += grasp_reward
 
-        # === 1. Trigger 按压奖励 ===
+        # === 1. trigger press reward ===
         trigger_pressed = self._check_trigger_pressed()
         self._trigger_pressed_steps += 1
         self._trigger_pressed_steps[~trigger_pressed] = 0
@@ -295,35 +295,35 @@ class GraspDrillStage2Env(GraspDrillEnv):
         trigger_hold_bonus = (self._trigger_pressed_steps >= self._trigger_press_threshold).float() * 500.0
         total_reward += trigger_reward + trigger_hold_bonus
 
-        # === 2. 电钻保持朝上奖励 ===
+        # === 2. keep drill pointing up reward ===
         upright = self._get_drill_uprightness()
         upright_reward = upright * 20.0
         total_reward += upright_reward
 
-        # === 3. 电钻朝上稳定性奖励 ===
+        # === 3. drill-up stability reward ===
         self._update_orientation_buffer()
         mean_upright = self._drill_orientation_buffer.mean(dim=1)
         upright_stability_reward = (mean_upright > 0.8).float() * 100.0
         total_reward += upright_stability_reward
 
-        # === 4. 手部在电钻附近 ===
+        # === 4. hand near the drill ===
         drill_pos = self.drill.data.root_pos_w
         hand_base_pos = self.franka.data.root_pos_w
         hand_drill_dist = torch.norm(hand_base_pos - drill_pos, dim=1)
         proximity_reward = torch.clamp(1.0 - hand_drill_dist / 0.5, 0.0, 1.0) * 5.0
         total_reward += proximity_reward
 
-        # === 5. 关节速度惩罚 ===
+        # === 5. joint velocity penalty ===
         joint_vel = self.franka.data.joint_vel
         vel_penalty = -torch.sum(joint_vel ** 2, dim=1) * 0.01
         total_reward += vel_penalty
 
-        # === 6. 接触维持奖励 ===
+        # === 6. contact-maintenance reward ===
         contact_ok = self._get_contact_ok()
         contact_reward = contact_ok.float() * 20.0
         total_reward += contact_reward
 
-        # --- 写入 extras["log"]（TensorBoard）---
+        # --- write to extras["log"] (TensorBoard) ---
         if "log" not in self.extras:
             self.extras["log"] = dict()
         self.extras["log"]["reward_grasp"] = grasp_reward.mean()
@@ -343,7 +343,7 @@ class GraspDrillStage2Env(GraspDrillEnv):
         return total_reward
 
     def _get_contact_ok(self) -> torch.Tensor:
-        """检查是否有足够的接触"""
+        """Check whether there is enough contact"""
         contact_force_threshold = 0.1
         all_hand_sensors = [
             "contact_index_intermediate", "contact_thumb_distal",
@@ -374,18 +374,18 @@ class GraspDrillStage2Env(GraspDrillEnv):
         return contact_count >= 4
 
     # -------------------------------------------------------------------------
-    # 问题2修复：_get_stage2_dones 复用父类 NaN 检测
+    # fix 2: _get_stage2_dones reuses the parent's NaN detection
     # -------------------------------------------------------------------------
     def _get_stage2_dones(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Stage2 终止条件：复用父类 NaN 检测 + Stage2 专属逻辑"""
-        # 先调父类获取 NaN 终止（物理 NaN 会导致崩溃，必须检测）
+        """Stage2 termination: reuse parent NaN detection + Stage2-specific logic"""
+        # call the parent first to get NaN termination (physical NaN causes crashes, must detect)
         parent_terminated, _ = super()._get_dones()
 
         failure = self._check_stage2_failure()
         time_outs = self.episode_length_buf >= self.max_episode_length
         trigger_hold_success = self._trigger_pressed_steps >= self._trigger_press_threshold
 
-        terminated = failure | parent_terminated  # 保留 NaN 终止
+        terminated = failure | parent_terminated  # keep NaN termination
         truncated = time_outs | trigger_hold_success
 
         self._cached_failure_mask = failure
@@ -393,7 +393,7 @@ class GraspDrillStage2Env(GraspDrillEnv):
         return terminated, truncated
 
     def _check_stage2_failure(self) -> torch.Tensor:
-        """Stage2 失败检测"""
+        """Stage2 failure detection"""
         drill_pos = self.drill.data.root_pos_w
         upright = self._get_drill_uprightness()
 

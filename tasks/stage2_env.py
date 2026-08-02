@@ -51,12 +51,12 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
         """
         Stage2: inherits all scene setup and observation logic from GraspDrillEnv.
         Custom: _reset_idx (pkl sampling), _get_rewards, _get_dones,
-        _get_observations (stage1 obs + plate 位姿 7 维 pos+quat).
+        _get_observations (stage1 obs + plate pose 7 dims pos+quat).
         """
 
-        # episode 级对齐成功判据:连续处于对齐区(dist<1cm ∧ angle<5°)≥ 该步数
-        # 即置位本局 sticky 成功标志(≈0.67s @30Hz)。写入 _cached_lenient_success,
-        # 供采集过滤 / deploy 统计 / failure stats 复用(与 stage1 同一接口)。
+        # episode-level alignment success: staying in the aligned region (dist<1cm and angle<5deg)
+        # for >= this many steps sets this episode's sticky success flag (~0.67s @30Hz). Written to
+        # _cached_lenient_success, reused by collection filtering / deploy stats / failure stats (same interface as stage1).
         ALIGN_SUCCESS_HOLD = 20
 
         def __init__(
@@ -66,14 +66,19 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             target_pos=(0.0, 0.0, 0.85),
             target_quat=(1.0, 0.0, 0.0, 0.0),
             debug=False,
+            success_hold_stop: int = 0,
             **kwargs,
         ):
             # ── PKL dataset (before super().__init__) ───────────
             self.success_dataset = success_dataset
             self.debug = debug
-            # 观测 = stage1 全部观测 + plate 位姿 7 维(pos_local 3 + quat wxyz 4)。
-            # plate 每回合随机 ±10cm/±10°,不进观测则目标不可见、任务不可解。
-            # 加载 stage1 checkpoint 时 train2.py 会对输入层做零填充扩展(自动按维度差)。
+            # >0: after holding alignment this many steps, terminate early and mark success
+            #     (same convention as ChainedEnv's success_hold_stop); 0: run to timeout (default,
+            #     matches stage2 RL training, which wants the fixed episode length for reward shaping).
+            self.success_hold_stop = int(success_hold_stop)
+            # obs = all stage1 obs + plate pose 7 dims (pos_local 3 + quat wxyz 4).
+            # plate is randomized +/-10cm/+/-10deg each episode; without it in the obs the target is invisible and the task unsolvable.
+            # when loading a stage1 checkpoint, train2.py zero-pads the input layer to extend it (auto by dim difference).
             cfg.observation_space = int(cfg.observation_space) + 7
 
             if target_pos is not None:
@@ -84,7 +89,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             # ── Delegate ALL scene + obs setup to GraspDrillEnv ──
             super().__init__(cfg, debug=debug, **kwargs)
 
-            # 对齐成功追踪:连续保持计数 + 本局 sticky 标志
+            # alignment success tracking: consecutive-hold counter + this episode's sticky flag
             self._align_hold_steps = torch.zeros(
                 self.num_envs, dtype=torch.long, device=self.device)
             self._align_achieved = torch.zeros(
@@ -132,7 +137,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 self._add_drill_bit_frame_visualization()
 
         def _setup_scene(self):
-            """设置场景 - 在 sensors 初始化前设置 plate collision API"""
+            """Set up the scene - set plate collision API before sensor init"""
             from tasks.grasp_drill_env import GraspDrillEnv
             GraspDrillEnv._setup_scene(self)
 
@@ -142,6 +147,72 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 self._setup_plate_contact_physics()
             except KeyError:
                 print("[WARN] Stage2: 'plate' not found in scene")
+
+        # ================================================================
+        def _randomize_plate(self, env_ids: torch.Tensor):
+            """Plate pose randomization (+/-10cm / +/-10deg about z) and rebuild Xform cache.
+
+            Extracted from _reset_idx, shared by Stage2 normal reset and ChainedEnv (chained play).
+
+            If self._plate_pose_override_fn is given, skip the random jitter and use the env-local
+            (pos, quat) it returns to place the plate (collect/deploy use it to pin the plate to a fixed
+            position, removing the \"alignment target changes every reset\" variable -- init_pose_file only
+            reproduces the drill, not the plate; a fixed plate lets the whole scene reproduce byte-for-byte).
+            """
+            if self.plate is None:
+                return
+            n = len(env_ids)
+            env_origins = self.scene.env_origins[env_ids]
+
+            _override = getattr(self, "_plate_pose_override_fn", None)
+            if _override is not None:
+                _pl, _q = _override(env_ids)
+                plate_pos_w = _pl.to(self.device).float() + env_origins
+                plate_quat = _q.to(self.device).float()
+            else:
+                # Base pos from init_state: (0, 1, 0.5), jitter ±10cm on x, y, z
+                plate_default_pos = torch.tensor([0.0, 1, 0.5], device=self.device)
+                rx = (torch.rand(n, device=self.device) * 0.20 - 0.10)  # [-0.10, 0.10]
+                ry = (torch.rand(n, device=self.device) * 0.20 - 0.10)  # [-0.10, 0.10]
+                rz = (torch.rand(n, device=self.device) * 0.20 - 0.10)  # [-0.10, 0.10]
+                jitter_pos = torch.stack([rx, ry, rz], dim=1)  # [n, 3]
+                plate_pos = plate_default_pos.unsqueeze(0) + jitter_pos  # [n, 3]
+                plate_pos_w = plate_pos + env_origins  # world coords
+
+                # Base rot from init_state, add ±10° on z only
+                base_quat = torch.tensor([0, 0.0, 0.0, 1], device=self.device)
+                delta_yaw = (torch.rand(n, device=self.device) - 0.5) * (2 * 0.1745)  # [-10°, +10°]
+                delta_quat = self._euler_to_quat(
+                    torch.zeros(n, device=self.device),  # no roll
+                    torch.zeros(n, device=self.device),  # no pitch
+                    delta_yaw
+                )  # [n, 4]
+                plate_quat = self._quat_mul_torch(delta_quat, base_quat.unsqueeze(0).expand(n, -1))  # [n, 4]
+                plate_quat = torch.nn.functional.normalize(plate_quat, dim=1)  # normalize to unit quat
+
+            plate_root_state = torch.cat([
+                plate_pos_w, plate_quat,
+                torch.zeros(n, 6, device=self.device),
+            ], dim=1)
+            self.plate.write_root_state_to_sim(plate_root_state, env_ids=env_ids)
+            # Invalidate cached Xform1 positions
+            if hasattr(self, "_xform1_pos_cache"):
+                delattr(self, "_xform1_pos_cache")
+            if hasattr(self, "_xform1_rot_cache"):
+                delattr(self, "_xform1_rot_cache")
+            # Always rebuild with freshly computed plate state so kinematics lag doesn't matter.
+            # For partial resets, we need full [num_envs] arrays: get unchanged values from cache
+            # (which we just deleted above, so read root_pos_w for unchanged envs).
+            if n < self.num_envs:
+                # Partial reset: merge unchanged + new
+                full_plate_pos = self.plate.data.root_pos_w.clone()
+                full_plate_quat = self.plate.data.root_quat_w.clone()
+                full_plate_pos[env_ids] = plate_pos_w
+                full_plate_quat[env_ids] = plate_quat
+                self._build_xform1_cache(full_plate_pos, full_plate_quat)
+            else:
+                # Full reset
+                self._build_xform1_cache(plate_pos_w, plate_quat)
 
         # ================================================================
         def _reset_idx(self, env_ids: torch.Tensor):
@@ -233,52 +304,8 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             env_origins = self.scene.env_origins[env_ids]
 
             # ── Plate position and rotation randomization ──
-            if self.plate is not None:
-                # Base pos from init_state: (0, 1, 0.5), jitter ±10cm on x, y, z
-                plate_default_pos = torch.tensor([0.0, 1, 0.5], device=self.device)
-                rx = (torch.rand(n, device=self.device) * 0.20 - 0.10)  # [-0.10, 0.10]
-                ry = (torch.rand(n, device=self.device) * 0.20 - 0.10)  # [-0.10, 0.10]
-                rz = (torch.rand(n, device=self.device) * 0.20 - 0.10)  # [-0.10, 0.10]
-                jitter_pos = torch.stack([rx, ry, rz], dim=1)  # [n, 3]
-                plate_pos = plate_default_pos.unsqueeze(0) + jitter_pos  # [n, 3]
-                plate_pos_w = plate_pos + env_origins  # world coords
+            self._randomize_plate(env_ids)
 
-                # Base rot from init_state: (0.2588, 0.0, 0.0, 0.9659), add ±10° on z only
-                base_quat = torch.tensor([0, 0.0, 0.0, 1], device=self.device)
-                delta_yaw = (torch.rand(n, device=self.device) - 0.5) * (2 * 0.1745)  # [-10°, +10°]
-                delta_quat = self._euler_to_quat(
-                    torch.zeros(n, device=self.device),  # no roll
-                    torch.zeros(n, device=self.device),  # no pitch
-                    delta_yaw
-                )  # [n, 4]
-                plate_quat = self._quat_mul_torch(delta_quat, base_quat.unsqueeze(0).expand(n, -1))  # [n, 4]
-                plate_quat = torch.nn.functional.normalize(plate_quat, dim=1)  # normalize to unit quat
-
-                plate_root_state = torch.cat([
-                    plate_pos_w, plate_quat,
-                    torch.zeros(n, 6, device=self.device),
-                ], dim=1)
-                self.plate.write_root_state_to_sim(plate_root_state, env_ids=env_ids)
-                # Invalidate cached Xform1 positions
-                if hasattr(self, "_xform1_pos_cache"):
-                    delattr(self, "_xform1_pos_cache")
-                if hasattr(self, "_xform1_rot_cache"):
-                    delattr(self, "_xform1_rot_cache")
-                # Always rebuild with freshly computed plate state so kinematics lag doesn't matter.
-                # For partial resets, we need full [num_envs] arrays: get unchanged values from cache
-                # (which we just deleted above, so read root_pos_w for unchanged envs).
-                if n < self.num_envs:
-                    # Partial reset: merge unchanged + new
-                    unchanged_mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
-                    unchanged_mask[env_ids] = False
-                    full_plate_pos = self.plate.data.root_pos_w.clone()
-                    full_plate_quat = self.plate.data.root_quat_w.clone()
-                    full_plate_pos[env_ids] = plate_pos_w
-                    full_plate_quat[env_ids] = plate_quat
-                    self._build_xform1_cache(full_plate_pos, full_plate_quat)
-                else:
-                    # Full reset
-                    self._build_xform1_cache(plate_pos_w, plate_quat)
             variant_ids = self._drill_variant_indices[env_ids]
             controlled = self.controlled_joint_indices
 
@@ -305,7 +332,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 _flat_bmax[vid]               = vdata["body_mask_max"]
                 _flat_up[vid*3:(vid+1)*3]    = vdata["up_axis"]
                 _flat_scale[vid*3:(vid+1)*3]  = vdata["scale"]
-                # parent 现在存多位姿列表(initial_pos_list),fallback 取第一条基础位姿
+                # parent now stores a multi-pose list (initial_pos_list); fallback takes the first base pose
                 _flat_pos[vid*3:(vid+1)*3]    = vdata["initial_pos_list"][0]
                 _flat_rot[vid*4:(vid+1)*4]    = vdata["initial_rot_list"][0]
 
@@ -327,14 +354,14 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                     vid = variant_ids[i].item()
                     pool = self._pkl_by_variant.get(vid, [])
                     if not pool:
-                        # 没有该 variant 的成功样本:退回该 variant 的基础初始位姿,
-                        # 避免 drill_pos_world 保持零(电钻被放到 env 原点)。
+                        # no success sample for this variant: fall back to this variant's base initial pose,
+                        # to avoid drill_pos_world staying zero (drill placed at the env origin).
                         if not hasattr(self, "_warned_missing_pkl_variant"):
                             self._warned_missing_pkl_variant = set()
                         if vid not in self._warned_missing_pkl_variant:
                             self._warned_missing_pkl_variant.add(vid)
-                            print(f"[WARN Stage2] pkl 中没有 variant {vid} 的样本,"
-                                  f"该 variant 将使用基础初始位姿(非抓取姿态)")
+                            print(f"[WARN Stage2] pkl has no samples for variant {vid},"
+                                  f"this variant will use the base initial pose (not a grasp pose)")
                         drill_pos_world[i] = _flat_pos.view(nv, 3)[vid] + env_origins[i]
                         drill_quat_world[i] = _flat_rot.view(nv, 4)[vid]
                         continue
@@ -397,9 +424,9 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 self._initial_link_body_dists = torch.zeros_like(link_dists)
             self._initial_link_body_dists[env_ids] = link_dists[env_ids].clone()
 
-            # ── 指尖在电钻局部系中的初始位置(全手握姿漂移惩罚的基准) ──
-            # 在 franka 关节写入 pkl 姿态之后计算,基准 = 成功抓握时各指尖
-            # 相对电钻的位形;_get_rewards 每步用同一变换比较偏差。
+            # -- fingertip initial positions in the drill local frame (baseline for whole-hand grasp-drift penalty) --
+            # computed after writing the pkl pose into franka joints; baseline = each fingertip's
+            # configuration relative to the drill at a successful grasp; _get_rewards compares drift with the same transform each step.
             tip_idx_init = self._get_fingertip_indices()
             if tip_idx_init is not None:
                 tips_w_init = self.franka.data.body_pos_w[env_ids][:, tip_idx_init, :]  # [n, F, 3]
@@ -418,7 +445,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
 
 
         # ================================================================
-        # Observation override: stage1 观测 + plate 位姿 6 维
+        # Observation override: stage1 obs + plate pose 6 dims
         # ================================================================
 
         def _get_observations(self) -> dict:
@@ -622,31 +649,31 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
 
 
 
-        # 握姿漂移惩罚追踪的指尖 body(缺失的自动跳过)
+        # fingertip bodies tracked for grasp-drift penalty (missing ones auto-skipped)
         _FINGERTIP_BODIES = ("R_index_intermediate", "R_middle_intermediate",
                              "R_ring_intermediate", "R_pinky_intermediate",
                              "R_thumb_distal")
 
         def _get_fingertip_indices(self):
-            """懒解析指尖 body 索引,返回 LongTensor 或 None(一个都没找到)。"""
+            """Lazily resolve fingertip body indices, return LongTensor or None (if none found)."""
             if not hasattr(self, "_fingertip_body_idx"):
                 names = list(self.franka.data.body_names)
                 idx = [names.index(n) for n in self._FINGERTIP_BODIES if n in names]
                 if idx:
                     self._fingertip_body_idx = torch.tensor(
                         idx, dtype=torch.long, device=self.device)
-                    print(f"[Stage2] tip_drift 追踪 {len(idx)} 个指尖: "
+                    print(f"[Stage2] tip_drift tracking {len(idx)} fingertips: "
                           f"{[names[i] for i in idx]}")
                 else:
                     self._fingertip_body_idx = None
-                    print("[WARN Stage2] 未找到任何指尖 body,tip_drift 惩罚关闭")
+                    print("[WARN Stage2] no fingertip body found, tip_drift penalty disabled")
             return self._fingertip_body_idx
 
         def _get_rewards(self) -> torch.Tensor:
-            """reward = proximity(双尺度) + orientation(距离门控)
-            + success(成功区内每步 +30,持续给、不终止)
-            + tip_drift(全手指尖相对电钻位形漂移,单指 clamp 0.2m)
-            + plate_contact 惩罚(防撞板)。"""
+            """reward = proximity (dual-scale) + orientation (distance-gated)
+            + success (+30 every step inside the success region, continuous, non-terminating)
+            + tip_drift (whole-hand fingertip configuration drift relative to the drill, single-finger clamp 0.2m)
+            + plate_contact penalty (anti-collision plate)."""
             if self.debug:
                 try:
                     import isaacsim.util.debug_draw._debug_draw as omni_debug_draw
@@ -657,7 +684,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                     pass
 
 
-            self._reward_components.clear()  # 只保留 Stage2 相关的 reward 分量
+            self._reward_components.clear()  # keep only Stage2-related reward components
 
             # ── Proximity reward: drill bit → plate Xform1 distance ──
             bit_pos, bit_dir_world, R_drill = self._compute_drill_bit_pos_w()
@@ -669,8 +696,8 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             xform1_rot = self._xform1_rot_cache    # [num_envs, 3, 3]
 
             dist = torch.norm(bit_pos - xform1_pos, dim=1)
-            # 双尺度:粗项(τ=0.5m)远处有引导,细项(τ=8cm)近处梯度陡。
-            # 上限仍 20,但远处"白拿"的基线减半,靠近的边际收益显著变大
+            # dual-scale: coarse term (tau=0.5m) gives guidance far away, fine term (tau=8cm) has a steep gradient near.
+            # cap is still 20, but the far-away \"free\" baseline is halved, so the marginal gain of getting close is much larger
             r_proximity = 10.0 * torch.exp(-dist / 0.5) + 10.0 * torch.exp(-dist / 0.08)
             plate_x_axis = xform1_rot[:, :, 0]  # [N, 3]
             plate_y_axis = xform1_rot[:, :, 1]  # [N, 3]
@@ -708,20 +735,17 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             angle = torch.acos(torch.clamp(dot_zy, -1.0, 1.0))   # [N] in radians [0, pi/2]
             r_align = torch.exp(-angle / 0.2)  # exp decay: 1 at 0deg, ~0.04 at 90deg
 
-            # Print axes for each env every 120 steps (non-debug mode)
+            # Print axes for each env every 120 steps (non-debug mode)。
+            # muted for stage1_only (ChainedEnv collects grasp segment only): alignment diagnostics are meaningless, just log noise.
             if not hasattr(self, "_axes_debug_counter"):
                 self._axes_debug_counter = 0
             self._axes_debug_counter += 1
-            if self._axes_debug_counter % 120 == 0:
+            if self._axes_debug_counter % 120 == 0 and not getattr(self, "stage1_only", False):
                 for env_i in range(min(3, self.num_envs)):
                     vid = variant_ids[env_i].item()
                     vattr = self._variant_attrs.get(vid, {})
                     vname = vattr.get("name", f"vid{vid}")
                     fwd = vattr.get("forward_axis", "Z")
-                    print(f"[Axes] env_{env_i} ({vname}, fwd={fwd}): "
-                          f"plate_neg_y=({plate_neg_y[env_i,0]:.3f},{plate_neg_y[env_i,1]:.3f},{plate_neg_y[env_i,2]:.3f})  "
-                          f"bit_dir=({bit_dir_world[env_i,0]:.3f},{bit_dir_world[env_i,1]:.3f},{bit_dir_world[env_i,2]:.3f})  "
-                          f"dot={dot_zy[env_i].item():.3f}")
 
             gate = torch.exp(-dist / 0.5)  # same decay scale as r_proximity
             r_orientation = r_align * gate * 20  # scale up to compensate (was *5, now gate<=1)
@@ -729,12 +753,12 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
 
             angle_deg = torch.rad2deg(angle)
             success_mask = (dist < 0.01) & (angle_deg < 5.0)
-            # 成功区内每步 +30,持续给、不终止(鼓励保持对齐到超时)
+            # +30 every step inside the success region, continuous, non-terminating (encourages holding alignment to timeout)
             r_success = success_mask.float() * 30.0
             reward = reward + r_success
 
-            # episode 级成功标志:连续保持 ALIGN_SUCCESS_HOLD 步 → sticky 置位
-            # (只用于成功判定/数据过滤,不参与 reward)
+            # episode-level success flag: held ALIGN_SUCCESS_HOLD consecutive steps -> sticky set
+            # (only for success detection / data filtering, not part of reward)
             self._align_hold_steps = torch.where(
                 success_mask,
                 self._align_hold_steps + 1,
@@ -793,7 +817,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             for name, tensor in self._reward_components.items():
                 if tensor is not None and tensor.numel() > 0:
                     self.extras["log"][f"reward_{name}"] = tensor.mean()
-            # 对齐成功监控:瞬时对齐比例 + episode 级滚动成功率(sticky 判据)
+            # alignment success monitoring: instant aligned ratio + episode-level rolling success rate (sticky criterion)
             self.extras["log"]["align_rate_now"] = success_mask.float().mean()
             if getattr(self, "_recent_filled", 0) > 0:
                 self.extras["log"]["success_rate_recent"] = \
@@ -875,9 +899,25 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             dist_delta = cur_max - init_max
             drop = dist_delta > 0.05
 
-            # episode 级成功 = 曾稳定对齐(sticky)且本步没有掉钻。
-            # 写入与 stage1 相同的接口,采集过滤 / deploy 统计 / _reset_idx 的
-            # failure stats 与 recent success rate 追踪均无需改动即可复用。
+            terminated = drop
+            # early stop: aligned for success_hold_stop consecutive steps -> terminate and mark success,
+            # instead of always running to time_out. Gated to a standalone Stage2Env instance only
+            # (e.g. --stage2_only data collection): ChainedEnv subclasses Stage2Env and calls this
+            # method directly (Stage2Env._get_dones(self)) purely to get the raw `drop` signal, then
+            # layers its OWN independent success_hold_stop early-stop on top -- if this block ran
+            # there too it would fold success_stop into the returned value under the same name
+            # `drop`/`terminated` that ChainedEnv relies on being the pure physical-drop signal,
+            # corrupting its `~drop` gating and its _cached_lenient_success bookkeeping.
+            # _align_hold_steps is updated in _get_rewards (one step after dones); the 1-step lag is fine.
+            if type(self) is Stage2Env and getattr(self, "success_hold_stop", 0) > 0:
+                success_stop = ~drop & (self._align_hold_steps >= self.success_hold_stop)
+                if success_stop.any():
+                    self._align_achieved |= success_stop
+                terminated = terminated | success_stop
+
+            # episode-level success = was stably aligned (sticky) and did not drop this step.
+            # written to the same interface as stage1; collection filtering / deploy stats / _reset_idx's
+            # failure stats and recent-success-rate tracking all reuse it with no changes.
             self._cached_lenient_success = self._align_achieved & ~drop
 
             # if not hasattr(self, "_done_log_counter"):
@@ -890,12 +930,12 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
             #           f"dist_delta_max={dist_delta.max().item()*100:.2f}cm  "
             #           f"(link_dist increased >5cm)")
 
-            return drop, time_out
+            return terminated, time_out
 
 
         def _draw_trigger_offset_viz(self):
             """Draw colored spheres at drill_bit_offset (world-space) for env_0..2.
-            Matches rewards_optimized.py tip_trigger_reward exactly:
+            Matches rewards.py tip_trigger_reward exactly:
               bit_scaled = drill_bit_offset * scale
               bit_world  = R_drill @ bit_scaled + drill_pos
 
@@ -933,7 +973,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 # ── Scale (per-env) ──
                 bit_offset_scaled = bit_offset_per_env * self._drill_scale  # [num_envs, 3]
 
-                # ── R_drill: drill-local → world (matches rewards_optimized.py quat_to_rotmat) ──
+                # ── R_drill: drill-local → world (matches rewards.py quat_to_rotmat) ──
                 q = F.normalize(drill_quat, dim=1)
                 w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
                 N = q.shape[0]
@@ -948,7 +988,7 @@ def _make_stage2_env(GraspDrillEnv, GraspDrillEnvCfg):
                 R_drill[:, 2, 1] = 2 * (y * z + w * x)
                 R_drill[:, 2, 2] = 1 - 2 * (x * x + y * y)
 
-                # ── World position (same formula as rewards_optimized.py) ──
+                # ── World position (same formula as rewards.py) ──
                 bit_world = torch.bmm(R_drill, bit_offset_scaled.unsqueeze(-1)).squeeze(-1) + drill_pos
 
                 # ── Resolve Xform1 world pos from cache (follows plate randomization) ──
@@ -1194,9 +1234,7 @@ def create_stage2_env_cfg(
     Build a GraspDrillEnvCfg (scene + observations from GraspDrillEnv).
     Stage2Env inherits it and overrides reward/done/reset only.
     """
-    from tasks.grasp_drill_env import create_grasp_drill_env_cfg, sim_utils, RigidObjectCfg
-    from isaaclab.sensors import ContactSensorCfg
-    _assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+    from tasks.grasp_drill_env import create_grasp_drill_env_cfg
 
     cfg = create_grasp_drill_env_cfg(
         num_envs=num_envs,
@@ -1204,40 +1242,12 @@ def create_stage2_env_cfg(
         headless=headless,
         debug=debug,
         drill_variants_path=drill_variants_path,
-        # stage2 是纯 RL(状态观测),不需要相机;默认 True 会 spawn TiledCamera,
-        # 没开 --enable_cameras 的 App 会在 sim.reset() 时直接崩,且开渲染极耗显存。
+        # stage2 is pure RL (state observation), no camera needed; default True would spawn a TiledCamera,
+        # an App without --enable_cameras crashes at sim.reset(), and enabling rendering is very VRAM-heavy.
         enable_cameras=False,
+        # plate + contact_plate sensor registration moved up to create_grasp_drill_env_cfg (globally shared)
+        include_plate=True,
     )
-
-    # ── Register plate to scene ──────────────────────────────
-    cfg.scene.plate = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Plate",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=os.path.join(_assets_dir, "plate.usd"),
-            activate_contact_sensors=True,
-            collision_props=sim_utils.CollisionPropertiesCfg(
-                collision_enabled=True,
-                contact_offset=0.005,
-                rest_offset=0.001,
-            ),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-            ),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0, 1, 0.5),
-            rot=(0, 0.0, 0.0, 1),
-        ),
-    )
-    # ── Plate contact sensor (detect drill-plate collision) ─
-    # The rigid body is at /Plate/Meshes; leaf_pattern matches "Meshes"
-    cfg.scene.contact_plate = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Plate/Meshes",
-        update_period=0.02,
-        history_length=0,
-        force_threshold=0.01,
-    )
-    # ────────────────────────────────────────────────────────
 
     if target_pos is not None:
         cfg.target_pos = tuple(target_pos)

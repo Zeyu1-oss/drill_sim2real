@@ -1,40 +1,40 @@
 """
-奖励函数定义 - 参考 RobustDexGrasp 设计
+Reward function definitions
 
-1. approach_reward_improved (接近奖励)
+1. approach_reward_improved (approach reward)
    body_approach_reward = Σ_i exp(-d_i / T) * 2
    
-   其中:
-   - d_i = min(||hand_link_i - body_point_j||)  # 第 i 个手部 link 到最近 body 点的距离
-   - T = finger_temp = 0.02  # 温度参数
-   - 权重: 2.0
+   where:
+   - d_i = min(||hand_link_i - body_point_j||)  # distance from the i-th hand link to the nearest body point
+   - T = finger_temp = 0.02  # temperature param
+   - weight: 2.0
    
    tip_trigger_reward = exp(-d_tip / 0.02) * 15
    
    
    avoid_penalty = -Σ_j forbidden_j * 5
    
-   - 约束条件: 把手 区域 y ∈ [-0.03, 0.055] (电钻局部坐标)
+   - constraint: handle region y in [-0.03, 0.055] (drill local coordinates)
    
-   总公式: approach_reward = body_approach + tip_trigger + avoid_penalty
+   total: approach_reward = body_approach + tip_trigger + avoid_penalty
 
 2. lift_reward 
    reward = lift_reward_weight * (z_diff / lift_height) * not_knocked_away
    
-   其中:
+   where:
    - z_diff = max(0, drill_z - initial_z)
-   - z_diff = min(z_diff, lift_height)  # 截断到最大 lift_height
+   - z_diff = min(z_diff, lift_height)  # clamp to max lift_height
    - lift_height = 0.1 
    - lift_reward_weight = 1.0
    - not_knocked_away = (xy_distance < max_xy_distance) ? 1 : 0
    - xy_distance = sqrt((x - x0)² + (y - y0)²)
 
-3. success_reward (成功奖励)
+3. success_reward (success reward)
    reward = success_reward_weight * success
    
-4. contact_reward_detailed (接触奖励)
+4. contact_reward_detailed (contact reward)
    reward = Σ sensors (contact_binary * weight + contact_binary * log(1 + force) * weight)
-   截断到50N
+   clamp to 50N
    - contact_binary = (force > force_threshold) ? 1 : 0
 
 """
@@ -51,18 +51,14 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply
 
-
-# ---------------------------------------------------------------------------
-# 工具函数
-# ---------------------------------------------------------------------------
 def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
-    """将四元数转换为旋转矩阵
+    """Convert quaternion to rotation matrix
 
     Args:
-        quat: 四元数 (N, 4)，格式为 (w, x, y, z)
+        quat: quaternion (N, 4), format (w, x, y, z)
 
     Returns:
-        旋转矩阵 (N, 3, 3)
+        rotation matrix (N, 3, 3)
     """
     q = torch.nn.functional.normalize(quat, dim=1)
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
@@ -82,7 +78,7 @@ def quat_to_rotmat(quat: torch.Tensor) -> torch.Tensor:
 
 
 def _points_to_world(local_points: torch.Tensor, drill_pos: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """将局部坐标点变换到世界坐标（使用预计算的R矩阵）"""
+    """Transform local points to world coordinates (using precomputed R matrix)"""
     num_envs = drill_pos.shape[0]
     local_expanded = local_points.T.unsqueeze(0).expand(num_envs, -1, -1)
     world_transformed = torch.bmm(R, local_expanded)
@@ -90,19 +86,18 @@ def _points_to_world(local_points: torch.Tensor, drill_pos: torch.Tensor, R: tor
 
 
 def _point_to_world(single_local: torch.Tensor, drill_pos: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
-    """将单个局部坐标点变换到世界坐标（1个点，expand后bmm+squeeze）"""
+    """Transform a single local point to world coordinates (1 point, expand then bmm+squeeze)"""
     num_envs = drill_pos.shape[0]
     expanded = single_local.view(1, 3, 1).expand(num_envs, -1, -1)
     return torch.bmm(R, expanded).squeeze(-1) + drill_pos
 
 
-# 预计算的 body_names 索引（避免每步重复 .index()）
-# key: 函数名, value: 预计算的 link_name -> body_names index 映射
-# 在第一次调用时填充，之后复用
+# precomputed body_names indices (avoid repeated .index() every step)
+# key: function name, value: precomputed link_name -> body_names index mapping
+# filled on first call, reused after
 _HAND_BODY_NAME_INDICES: dict = {}
 
 
-# ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -123,7 +118,7 @@ def contact_reward_detailed(
     num_envs = env.num_envs
     device = env.device
 
-    # 拇指这三个 link 只给接触 binary，不乘距离权重
+    # these three thumb links only get contact binary, not multiplied by distance weight
     thumb_no_dist_links = {
         "R_thumb_distal",
         "R_thumb_intermediate",
@@ -165,7 +160,7 @@ def contact_reward_detailed(
         "contact_hand_base":           "R_hand_base_link",
     }
 
-    # === 预计算距离权重 ===
+    # === precompute distance weights ===
     try:
         drill = env.drill
         hand = env.scene["franka"]
@@ -174,7 +169,7 @@ def contact_reward_detailed(
         hand_body_names = hand.body_names
         hand_body_pos = hand.data.body_pos_w
 
-        # 预计算 link_name → body_names index（避免每步13次 .index()）
+        # precompute link_name -> body_names index (avoid 13 .index() calls every step)
         link_to_body_idx = {name: i for i, name in enumerate(hand_body_names)}
 
         link_to_body_idx = {name: i for i, name in enumerate(hand_body_names)}
@@ -262,7 +257,7 @@ def contact_reward_detailed(
         total_reward = torch.zeros(num_envs, device=device)
 
     if not torch.all(torch.isfinite(total_reward)):
-        print(f"[ERROR] contact_reward_detailed 产生 NaN/Inf，强制清零")
+        print(f"[ERROR] contact_reward_detailed produced NaN/Inf, force-zeroed")
         total_reward = torch.nan_to_num(total_reward, nan=0.0)
 
 
@@ -282,28 +277,28 @@ def tip_trigger_reward(
     device = env.device
     num_envs = env.num_envs
 
-    # === 获取 trigger 点（per-env, using env's cached per-env tensors）===
+    # === get trigger point (per-env, using env's cached per-env tensors) ===
     trigger_offset = env._trigger1_offset  # [num_envs, 3] per-env
     scale_per_env = env._drill_scale       # [num_envs, 3] per-env
     trigger_offset_scaled = trigger_offset * scale_per_env  # [num_envs, 3]
 
-    # 局部坐标 → 世界坐标
+    # local coords -> world coords
     drill_pos  = drill.data.root_pos_w
     drill_quat = drill.data.root_quat_w
     R = quat_to_rotmat(drill_quat)  # [num_envs, 3, 3]
     trigger_center_world = torch.bmm(R, trigger_offset_scaled.unsqueeze(-1)).squeeze(-1) + drill_pos  # [num_envs, 3]
 
-    # === 获取 R_index_intermediate 位置 ===
+    # === get R_index_intermediate position ===
     body_names = hand.data.body_names
     if "R_index_intermediate" not in body_names:
         if verbose:
-            print("[WARN] tip_trigger_reward: 未找到 R_index_intermediate")
+            print("[WARN] tip_trigger_reward: R_index_intermediate not found")
         return torch.zeros(num_envs, device=device, dtype=torch.float32)
 
     index_idx = body_names.index("R_index_intermediate")
     intermediate_pos_world = hand.data.body_pos_w[:, index_idx, :]  # [num_envs, 3]
 
-    # === 计算奖励 ===
+    # === compute reward ===
     dist   = torch.norm(intermediate_pos_world - trigger_center_world, dim=-1)
 
     precise_bonus = torch.exp(-dist / 0.015) * 50
@@ -320,14 +315,14 @@ def tip_trigger_reward(
     if nan_mask.any():
         result = torch.where(nan_mask, torch.zeros_like(result), result)
 
-    # === Debug 可视化：index_intermediate → trigger_center ===
+    # === Debug viz: index_intermediate -> trigger_center ===
     debug_mode = getattr(env, 'debug', False)
     if debug_mode:
         if not hasattr(env, '_tip_trigger_vis_counter'):
             env._tip_trigger_vis_counter = 0
         env._tip_trigger_vis_counter += 1
         
-        if env._tip_trigger_vis_counter % 1 == 0:  # 每5步画一次，改这个数字
+        if env._tip_trigger_vis_counter % 1 == 0:  # draw every 5 steps, change this number
             try:
                 import isaacsim.util.debug_draw._debug_draw as omni_debug_draw
                 import numpy as np
@@ -346,7 +341,7 @@ def tip_trigger_reward(
                     tip_lines_src.append(tip_pos.tolist())
                     tip_lines_tgt.append(target_pos.tolist())
 
-                    # 橙色=食指中间关节，白色=trigger质心
+                    # orange=index intermediate joint, white=trigger centroid
                     tip_points_pos   += [tip_pos.tolist(), target_pos.tolist()]
                     tip_points_colors += [[1.0, 0.5, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]]
                     tip_points_sizes  += [40.0, 30.0]
@@ -384,25 +379,25 @@ def thumb_approach_reward(
     scale_per_env = env._drill_scale              # [num_envs, 3]
     thumb_target_local_scaled = thumb_target_local * scale_per_env  # match trigger_offset treatment
 
-    # === 局部坐标 → 世界坐标 ===
+    # === local coords -> world coords ===
     drill_pos  = drill.data.root_pos_w
     drill_quat = drill.data.root_quat_w
     R = quat_to_rotmat(drill_quat)
     thumb_target_world = torch.bmm(R, thumb_target_local_scaled.unsqueeze(-1)).squeeze(-1) + drill_pos
 
-    # === 获取 thumb_distal 位置 ===
+    # === get thumb_distal position ===
     body_names = hand.body_names
     thumb_distal_candidates = [name for name in body_names if "thumb" in name and "distal" in name]
     if len(thumb_distal_candidates) == 0:
         if verbose:
-            print("[WARN] thumb_approach_reward: 未找到 thumb_distal link")
+            print("[WARN] thumb_approach_reward: thumb_distal link not found")
         return torch.zeros(num_envs, device=device, dtype=torch.float32)
 
     thumb_distal_name = thumb_distal_candidates[0]
     thumb_idx = body_names.index(thumb_distal_name)
     thumb_distal_pos_world = hand.data.body_pos_w[:, thumb_idx, :]  # [num_envs, 3]
 
-    # === 计算奖励 ===
+    # === compute reward ===
     dist   = torch.norm(thumb_distal_pos_world - thumb_target_world, dim=-1)
     # print(f"[thumb_approach] dist env0={dist[0]:.4f} env1={dist[1]:.4f} env2={dist[2]:.4f} m")
     reward = torch.exp(-dist / finger_temp)
@@ -413,7 +408,7 @@ def thumb_approach_reward(
     if nan_mask.any():
         result = torch.where(nan_mask, torch.zeros_like(result), result)
 
-    # === Debug 可视化：thumb_distal → 目标点 ===
+    # === Debug viz: thumb_distal -> target point ===
     debug_mode = getattr(env, 'debug', False)
     if debug_mode:
         try:
@@ -435,7 +430,7 @@ def thumb_approach_reward(
                 tip_lines_src.append(thumb_pos.tolist())
                 tip_lines_tgt.append(target_pos.tolist())
 
-                # 紫色=拇指末端，白色=目标点
+                # purple=thumb tip, white=target point
                 tip_points_pos    += [thumb_pos.tolist(), target_pos.tolist()]
                 tip_points_colors += [[0.8, 0.2, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]
                 tip_points_sizes  += [40.0, 30.0]
@@ -467,7 +462,7 @@ def approach_reward_improved(
     device = env.device
     num_envs = env.num_envs
 
-    # === 获取 drill variant 信息 ===
+    # === get drill variant info ===
     use_split = False
     try:
         all_variant_ids = env._drill_variant_indices.tolist()
@@ -480,15 +475,12 @@ def approach_reward_improved(
     drill_pos = drill.data.root_pos_w
     drill_quat = drill.data.root_quat_w
 
-    # === 预计算 R ===
     R_all = quat_to_rotmat(drill_quat)  # [num_envs, 3, 3]
-    # 直接使用预维护的 _drill_scale，不再循环构建
     scales_tensor = env._drill_scale  # [num_envs, 3]
 
     if use_split:
-        # === 按 variant 分组批量构建 body_points_world ===
         unique_vids = env._drill_variant_indices.unique().tolist()
-        # 预降采样：计算每个 variant 的采样后点数
+        # pre-downsample: compute the post-sampling point count for each variant
         var_sampled_pts = {}
         for vid in unique_vids:
             vdata = env._variant_attrs[vid]
@@ -499,9 +491,8 @@ def approach_reward_improved(
                 n = len(bp)
                 if n > NUM_SAMPLE_POINTS_BODY_FILTERED:
                     bp = bp[::n // NUM_SAMPLE_POINTS_BODY_FILTERED][:NUM_SAMPLE_POINTS_BODY_FILTERED]
-                var_sampled_pts[vid] = bp  # [N, 3] 已在 env 初始化时预处理
+                var_sampled_pts[vid] = bp  # [N, 3] preprocessed at env init
 
-        # 取最大点数作为 padding 长度
         max_body_pts = max(
             pts.shape[0] for pts in var_sampled_pts.values() if pts is not None
         ) if var_sampled_pts else 0
@@ -522,14 +513,14 @@ def approach_reward_improved(
             if bp is None or len(bp) == 0:
                 continue
 
-            scale = env._variant_attrs[vid]["scale"]  # [3]，同一 variant 所有 env 相同
+            scale = env._variant_attrs[vid]["scale"]  # [3], same for all envs of the same variant
             bp_scaled = bp * scale                     # [N, 3]
             n_pts = bp_scaled.shape[0]
 
             R_v = R_all[env_idx_list]                    # [n, 3, 3]
             pos_v = drill_pos[env_idx_list]                # [n, 3]
 
-            # 批量变换: [n, 3, N] -> [n, N, 3]
+            # batch transform: [n, 3, N] -> [n, N, 3]
             bp_exp = bp_scaled.T.unsqueeze(0).expand(len(env_idx_list), 3, -1)  # [n, 3, N]
             pts_w = torch.bmm(R_v, bp_exp).transpose(1, 2) + pos_v.unsqueeze(1)  # [n, N, 3]
 
@@ -541,7 +532,7 @@ def approach_reward_improved(
         body_pts_mask = torch.zeros((num_envs, 1), dtype=torch.bool, device=device)
         max_body_pts = 1
 
-    # link 位置
+    # link positions
     body_names = hand.body_names
     hand_link_mask = torch.tensor(
         [name.startswith("R_")
@@ -559,11 +550,11 @@ def approach_reward_improved(
     num_hand = len(hand_names)
     hand_pos_all = hand.data.body_pos_w[:, hand_link_mask, :]
 
-    # === 所有 link 都使用 body_mask 区域的点 ===
+    # === all links use points from the body_mask region ===
     threshold_far = 1.0
 
     if max_body_pts > 0 and body_pts_mask.any():
-        # 批量计算距离: [n_env, n_links, 3] x [n_env, max_pts, 3] -> [n_env, n_links, max_pts]
+        # batch distance: [n_env, n_links, 3] x [n_env, max_pts, 3] -> [n_env, n_links, max_pts]
         all_dists = torch.cdist(hand_pos_all, body_pts_padded)  # [n_env, n_links, max_pts]
         all_dists = all_dists.masked_fill(~body_pts_mask.unsqueeze(1), float('inf'))
         dists_min = all_dists.min(dim=2).values  # [n_env, n_links]
@@ -573,7 +564,7 @@ def approach_reward_improved(
     else:
         dists_min = torch.full((num_envs, num_hand), threshold_far + 1.0, device=device)
 
-    # 批量计算 reward
+    # batch-compute reward
     valid_mask = dists_min < threshold_far
     reward_per_link = torch.where(valid_mask, torch.exp(-dists_min / finger_temp),
                                   torch.zeros_like(dists_min))
@@ -586,7 +577,7 @@ def approach_reward_improved(
     if nan_mask.any():
         result = torch.where(nan_mask, torch.zeros_like(result), result)
 
-    # === DEBUG 可视化：每个env用自己的variant body_mask区域 ===
+    # === DEBUG viz: each env uses its own variant body_mask region ===
     debug_mode = getattr(env, 'debug', False)
     if debug_mode:
         if not hasattr(env, '_reward_debug_counter'):
@@ -736,7 +727,7 @@ def lift_reward(
     z_diff = torch.clamp(z_diff, min=0.0, max=lift_height)
     reward = lift_reward_weight * (z_diff / lift_height)
 
-    # === trigger 点世界坐标（使用 variant 0 作为代表，误差可接受）===
+    # === trigger point world coords (using variant 0 as representative, acceptable error) ===
     try:
         vid0 = env._drill_variant_indices[0].item()
         trigger_pts, _, _, _ = env._build_variant_surface_points(vid0)
@@ -762,7 +753,7 @@ def lift_reward(
         R, trigger_center.view(1, 3, 1).expand(num_envs, -1, -1)
     ).squeeze(-1) + drill_pos  # [num_envs, 3]
 
-    # === index intermediate 位置（与 tip_trigger_reward 一致，无 offset）===
+    # === index intermediate position (same as tip_trigger_reward, no offset) ===
     hand: Articulation = env.scene[hand_cfg.name]
     body_names_full = list(hand.body_names)
     if "R_index_intermediate" in body_names_full:
@@ -848,7 +839,7 @@ def success_reward(
                     force_mag = torch.nan_to_num(force_mag, nan=0.0)
                     has_contact = force_mag > success_contact_force_threshold
                     contact_count += has_contact.float()
-                    # 单独追踪拇指两个关键接触点
+                    # separately track the thumb's two key contact points
                     if sensor_name == "contact_thumb_intermediate":
                         thumb_intermediate_contact = has_contact.clone()
                     elif sensor_name == "contact_thumb_proximal":
@@ -872,7 +863,7 @@ def success_reward(
 
     trigger_center_world = torch.bmm(R, trigger_offset_scaled.unsqueeze(-1)).squeeze(-1) + drill_pos  # [num_envs, 3]
 
-    # === index_intermediate 到 trigger 距离 ===
+    # === index_intermediate to trigger distance ===
     body_names = list(hand.body_names)
     if "R_index_intermediate" not in body_names:
         return torch.zeros(num_envs, device=device, dtype=torch.float32)
@@ -990,7 +981,7 @@ def drill_y_axis_tilt_penalty(
     num_envs = env.num_envs
 
     drill = env.drill
-    drill_quat = drill.data.root_quat_w  # [num_envs, 4], 格式 (w, x, y, z)
+    drill_quat = drill.data.root_quat_w  # [num_envs, 4], format (w, x, y, z)
 
     qw = drill_quat[:, 0]
     qx = drill_quat[:, 1]
@@ -1012,29 +1003,29 @@ def drill_y_axis_tilt_penalty(
         env._up_axis[:, 2] * r_z
     )
 
-    # |up_z| 越大越竖直；acos(|up_z|) 得到倾斜角
+    # larger |up_z| = more vertical; acos(|up_z|) gives the tilt angle
     up_z_clamped = torch.clamp(torch.abs(up_z), -1.0, 1.0)
     tilt_angle_deg = torch.acos(up_z_clamped) * 180.0 / torch.pi
 
-    # 连续惩罚：超过阈值后，惩罚随 tilt 线性增长
-    # tilt = tilt_threshold_deg 时 → 0
-    # tilt = 60° 时 → penalty
-    # tilt = 90° 时 → 2 * penalty
-    # 公式: reward = penalty * (tilt - threshold) / (60 - threshold)
+    # continuous penalty: beyond the threshold, penalty grows linearly with tilt
+    # tilt = tilt_threshold_deg -> 0
+    # tilt = 60deg -> penalty
+    # tilt = 90deg -> 2 * penalty
+    # formula: reward = penalty * (tilt - threshold) / (60 - threshold)
     reward = torch.zeros(num_envs, device=device, dtype=torch.float32)
     if tilt_threshold_deg < 60.0:
         slope = penalty / (60.0 - tilt_threshold_deg)
         excess = tilt_angle_deg - tilt_threshold_deg
         reward = slope * torch.clamp(excess, min=0.0)
     else:
-        # fallback：tilt > 60° 后才给全额 penalty
+        # fallback: full penalty only after tilt > 60deg
         reward = torch.where(
             tilt_angle_deg > tilt_threshold_deg,
             torch.full_like(tilt_angle_deg, penalty),
             torch.zeros_like(tilt_angle_deg),
         )
 
-    # 调试打印
+    # debug print
     # debug_mode = getattr(env, 'debug', False)
     # if debug_mode:
     #     if not hasattr(env, '_y_tilt_debug_counter'):
@@ -1051,8 +1042,8 @@ def drill_y_axis_tilt_penalty(
     return reward.to(torch.float32)
 
 
-# 传感器接触力过大惩罚（force > 15N）
-# 每超过 5N 增加 1 惩罚：penalty = max(0, floor((fmag - 15) / 5))
+# penalty for excessive sensor contact force (force > 15N)
+# +1 penalty per 5N over: penalty = max(0, floor((fmag - 15) / 5))
 def weak_contact_penalty(
     env,
     force_high: float = 15.0,
@@ -1098,16 +1089,192 @@ def weak_contact_penalty(
 # ---------------------------------------------------------------------------
 def register_all_rewards():
     REWARD_REGISTRY.update({
-        # 原有奖励（保留）
+        # existing rewards (kept)
         'lift': lift_reward,
         'approach_improved': approach_reward_improved,
         'tip_trigger': tip_trigger_reward,
         'success': success_reward,
-        'contact_detailed': contact_reward_detailed,  # 详细版接触奖励（参考论文）
-        'y_axis_tilt_penalty': drill_y_axis_tilt_penalty,  # 电钻Y轴倾斜惩罚（>30°给-0.02）
-        'thumb_distal_reward': thumb_approach_reward,  # 拇指尖端奖励
-        'weak_contact_penalty': weak_contact_penalty,  # 接触力过大惩罚（force > 15N）
+        'contact_detailed': contact_reward_detailed,  # detailed contact reward (from the paper)
+        'y_axis_tilt_penalty': drill_y_axis_tilt_penalty,  # drill Y-axis tilt penalty (>30deg gives -0.02)
+        'thumb_distal_reward': thumb_approach_reward,  # thumb tip reward
+        'weak_contact_penalty': weak_contact_penalty,  # excessive contact force penalty (force > 15N)
     })
 
 
 register_all_rewards()
+
+
+# ===========================================================================
+# Stage2 rewards (drill alignment task) -- merged from the former stage2_rewards.py.
+# These reuse quat_to_rotmat defined above. Currently unused by the live stage2
+# path (stage2_env._get_rewards computes rewards inline); kept here as a library.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# R1: alignment reward (position + rotation, sparse)
+# ---------------------------------------------------------------------------
+
+def stage2_alignment_reward(
+    env: ManagerBasedRLEnv,
+    pos_thresh: float = 0.001,
+    rot_thresh: float = 0.9999,
+    pos_weight: float = 100.0,
+    rot_weight: float = 100.0,
+    pos_partial_start: float = 0.01,
+    rot_partial_start: float = 0.999,
+) -> torch.Tensor:
+    """
+    Sparse alignment reward:
+    - position error < pos_thresh (1mm) gives pos_weight
+    - rotation error (quaternion dot) > rot_thresh gives rot_weight
+    - linear partial reward in between
+
+    Target pose read from env.target_pos / env.target_quat.
+    """
+    num_envs = env.num_envs
+    device = env.device
+
+    drill_pos = env.drill.data.root_pos_w
+    drill_quat = env.drill.data.root_quat_w
+    target_pos = env.target_stage2_alignment_rewardpos
+    target_quat = env.target_quat
+
+    # position error
+    pos_error = torch.norm(drill_pos - target_pos, dim=1)
+    pos_success = pos_error < pos_thresh
+    pos_partial = (pos_error < pos_partial_start) & ~pos_success
+    pos_reward = torch.zeros(num_envs, device=device, dtype=torch.float32)
+    pos_reward[pos_success] = pos_weight
+    pos_reward[pos_partial] = pos_weight * 0.5 * (1 - pos_error[pos_partial] / pos_partial_start)
+
+    # rotation error (quaternion dot, abs to avoid sign ambiguity)
+    # q1 . q2 = w1*w2 + x1*x2 + y1*y2 + z1*z2; 1=aligned, 0=90deg, -1=180deg
+    q_dot = (
+        drill_quat[:, 0] * target_quat[:, 0] +
+        drill_quat[:, 1] * target_quat[:, 1] +
+        drill_quat[:, 2] * target_quat[:, 2] +
+        drill_quat[:, 3] * target_quat[:, 3]
+    ).abs()
+    rot_success = q_dot > rot_thresh
+    rot_partial = (q_dot > rot_partial_start) & ~rot_success
+    rot_reward = torch.zeros(num_envs, device=device, dtype=torch.float32)
+    rot_reward[rot_success] = rot_weight
+    rot_reward[rot_partial] = rot_weight * 0.5 * ((q_dot[rot_partial] - rot_partial_start) / (rot_thresh - rot_partial_start))
+
+    return pos_reward + rot_reward
+
+
+# ---------------------------------------------------------------------------
+# R2: grasp-quality maintenance reward
+# ---------------------------------------------------------------------------
+
+def stage2_grasp_quality_reward(
+    env: ManagerBasedRLEnv,
+    finger_dist_thresh: float = 0.03,
+    min_contacts: int = 6,
+    force_thresh: float = 0.1,
+    weight: float = 80.0,
+) -> torch.Tensor:
+    """
+    Maintain the grasp quality from Stage1 success:
+    - R_index_intermediate near the trigger (< 3cm)
+    - at least min_contacts sensor contact forces > force_thresh
+    """
+    num_envs = env.num_envs
+    device = env.device
+
+    hand = env.scene["franka"]
+    drill = env.drill
+
+    # finger_near_trigger
+    finger_near_trigger = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    try:
+        body_names = hand.data.body_names
+        if "R_index_intermediate" in body_names:
+            idx = body_names.index("R_index_intermediate")
+            index_pos = hand.data.body_pos_w[:, idx, :]
+            trigger_offset = env._trigger1_offset * env._drill_scale
+            drill_pos = drill.data.root_pos_w
+            R = quat_to_rotmat(drill.data.root_quat_w)
+            trigger_world = torch.bmm(R, trigger_offset.unsqueeze(-1)).squeeze(-1) + drill_pos
+            dist = torch.norm(index_pos - trigger_world, dim=1)
+            finger_near_trigger = dist < finger_dist_thresh
+    except Exception:
+        finger_near_trigger = torch.ones(num_envs, dtype=torch.bool, device=device)
+
+    # multi_contact_ok
+    multi_contact_ok = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    all_hand_sensors = [
+        "contact_index_intermediate",
+        "contact_thumb_distal",
+        "contact_middle_intermal",
+        "contact_middle_proximal",
+        "contact_ring_proximal",
+        "contact_pinky_proximal",
+        "contact_hand_base",
+    ]
+    try:
+        if hasattr(env.scene, "sensors"):
+            contact_count = torch.zeros(num_envs, device=device, dtype=torch.float32)
+            for sname in all_hand_sensors:
+                if sname in env.scene.sensors:
+                    s = env.scene.sensors[sname]
+                    fm = s.data.force_matrix_w
+                    if fm is not None:
+                        fm = torch.nan_to_num(fm, nan=0.0, posinf=0.0, neginf=0.0)
+                        fm = torch.clamp(fm, -50.0, 50.0)
+                        fmag = torch.norm(fm.sum(dim=(1, 2)), dim=1)
+                    else:
+                        fmag = torch.norm(s.data.net_forces_w.sum(dim=1), dim=1)
+                    fmag = torch.nan_to_num(fmag, nan=0.0)
+                    contact_count += (fmag > force_thresh).float()
+            multi_contact_ok = contact_count >= min_contacts
+    except Exception:
+        multi_contact_ok = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    # weighting: partial satisfaction gives partial reward
+    reward = torch.zeros(num_envs, device=device, dtype=torch.float32)
+    both_ok = finger_near_trigger & multi_contact_ok
+    reward[both_ok] = weight
+    any_ok = finger_near_trigger | multi_contact_ok
+    partial = any_ok & ~both_ok
+    reward[partial] = weight * 0.3
+
+    return reward
+
+
+# ---------------------------------------------------------------------------
+# R3: tip2tip distance reward
+# ---------------------------------------------------------------------------
+
+def stage2_tip_distance_reward(
+    env: ManagerBasedRLEnv,
+    temp: float = 0.03,
+    weight: float = 15.0,
+) -> torch.Tensor:
+    """
+    Gaussian distance reward between thumb_distal and R_index_intermediate:
+    exp(-dist / temp)
+    """
+    num_envs = env.num_envs
+    device = env.device
+
+    hand = env.scene["franka"]
+    try:
+        body_names = hand.data.body_names
+        thumb_candidates = [n for n in body_names if "thumb" in n and "distal" in n]
+        index_candidates = [n for n in body_names if "index" in n and "intermediate" in n]
+        if not thumb_candidates or not index_candidates:
+            return torch.zeros(num_envs, device=device, dtype=torch.float32)
+
+        thumb_idx = body_names.index(thumb_candidates[0])
+        index_idx = body_names.index(index_candidates[0])
+
+        thumb_pos = hand.data.body_pos_w[:, thumb_idx, :]
+        index_pos = hand.data.body_pos_w[:, index_idx, :]
+        dist = torch.norm(thumb_pos - index_pos, dim=1)
+        dist = torch.nan_to_num(dist, nan=1.0, posinf=1.0)
+        reward = weight * torch.exp(-dist / temp)
+        return torch.clamp(reward, 0.0, weight)
+    except Exception:
+        return torch.zeros(num_envs, device=device, dtype=torch.float32)

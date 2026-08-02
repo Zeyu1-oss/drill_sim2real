@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camera Visualization Script - 输出几张 RGB 图像用于调整相机位置。
+Camera Visualization Script - output a few RGB images to tune camera placement.
 
 Usage:
     python debug_camera_viz.py --checkpoint runs/xxx/nn/xxx.pth --save_images
@@ -14,25 +14,25 @@ import time
 import numpy as np
 import torch
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root (scripts/debug/ -> ../../..)
 sys.path.insert(0, project_root)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="相机可视化 - 持续播放 checkpoint 并显示相机画面")
-    parser.add_argument("--checkpoint", type=str, required=True, help="RL checkpoint path")
-    parser.add_argument("--num_envs", type=int, default=1, help="并行环境数量")
-    parser.add_argument("--device", type=str, default="cuda:0", help="设备")
-    parser.add_argument("--headless", action="store_true", help="无头模式")
-    parser.add_argument("--save_images", action="store_true", help="周期性保存 RGB 图像到 output/ 目录")
-    parser.add_argument("--img_height", type=int, default=384, help="图像高度")
-    parser.add_argument("--img_width", type=int, default=384, help="图像宽度")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
-    parser.add_argument("--debug", action="store_true", help="启用环境调试模式")
-    parser.add_argument("--drill_configs", type=str, default=None, help="钻头配置 YAML 路径")
-    parser.add_argument("--log_interval", type=int, default=30, help="每隔多少步打印一次相机统计")
-    parser.add_argument("--save_interval", type=int, default=10, help="每隔多少步保存一次图像")
-    parser.add_argument("--max_steps", type=int, default=1, help="最大运行步数，0 表示一直运行到手动关闭")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--num_envs", type=int, default=1)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--save_images", action="store_true")
+    parser.add_argument("--img_height", type=int, default=384)
+    parser.add_argument("--img_width", type=int, default=384)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--drill_configs", type=str, default=None)
+    parser.add_argument("--log_interval", type=int, default=30)
+    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--max_steps", type=int, default=1)
     return parser.parse_args()
 
 
@@ -122,18 +122,28 @@ def main():
             img_height=args.img_height,
             img_width=args.img_width,
             enable_cameras=True,
+            include_plate=True,          # plate in sim (reference pose 0,1,0.5)
+            include_plate_camera=True,   # cam3 = plate camera
         )
-        # Add rgb data type for visualization (doesn't affect trained policy)
-        for _cn in ("cam1", "cam2"):   # cam1=30cm跟随 cam2=固定工作区,两个都要 RGB
-            _c = getattr(cfg.scene, _cn, None)
-            if _c is not None and "rgb" not in _c.data_types:
-                _c.data_types = ["rgb"] + list(_c.data_types)
+        # standard 3-camera pipeline (chained mode): cam1=front-top full table, cam2=wrist cam
+        # (mounted on L_flange, follows the hand), cam3=plate. All defined in
+        # create_grasp_drill_env_cfg; here we only add rgb for visualization.
+        from perception.camera_setup import ensure_rgb_aov, apply_render_settings
+        ensure_rgb_aov(cfg.scene)
         cfg.seed = args.seed
         cfg.log_dir = os.path.dirname(os.path.dirname(args.checkpoint))
 
         print("\n[INFO] Creating environment with cameras...")
         base_env = GraspDrillEnv(cfg=cfg, debug=args.debug)
         env_unwrapped = base_env.unwrapped
+
+        # delete the MultiAssetSpawner template prototype so the camera view has no overlapping ghost drills
+        from isaaclab.sim.utils import delete_prim
+        try:
+            delete_prim("/World/Template")
+            print("[INFO] deleted /World/Template")
+        except Exception as e:
+            print(f"[WARN] failed to delete /World/Template: {e}")
 
         # Follow play_drill.py order: reset BEFORE timeline.play()
         print("[INFO] Resetting environment...")
@@ -166,25 +176,17 @@ def main():
 
         scene_keys = list(env_unwrapped.scene.keys())
         print(f"[INFO] Available scene keys: {scene_keys}")
-        for _cn in ("cam1", "cam2"):
+        cam_names = ("cam1", "cam2", "cam3")   # standard pipeline: cam1=front-top cam2=wrist cam3=plate
+        for _cn in cam_names:
             if _cn not in scene_keys:
                 print(f"[ERROR] Camera '{_cn}' not found in scene. Available: {scene_keys}")
                 return
 
-        cam1 = env_unwrapped.scene["cam1"]   # 30cm 跟随电钻
-        cam2 = env_unwrapped.scene["cam2"]   # 固定工作区
-        print("[INFO] Cameras cam1 + cam2 found successfully.")
+        cams = [(name, env_unwrapped.scene[name]) for name in cam_names]
+        print(f"[INFO] Cameras {' + '.join(cam_names)} found successfully.")
 
         dt = env_unwrapped.step_dt
-        settings = carb.settings.get_settings()
-        settings.set("/app/player/useFixedTimeStepping", True)
-        settings.set("/app/player/targetFrameRate", int(1.0 / dt))
-        settings.set("/app/runLoops/rendering_0/rateLimitEnabled", True)
-        settings.set("/app/runLoops/rendering_0/rateLimit", 60)
-        settings.set("/physics/updateToUsd", False)
-        settings.set("/physics/updateParticlesToUsd", False)
-        settings.set("/app/runLoops/main/enabled", True)
-        settings.set("/app/runLoops/main/syncTooFast", True)
+        apply_render_settings(dt)
 
         timeline = omni.timeline.get_timeline_interface()
         timeline.play()
@@ -217,33 +219,29 @@ def main():
             if isinstance(obs, dict):
                 obs = obs["obs"]
 
-            cam1.update(dt)
-            cam2.update(dt)
-
-            rgb1 = cam1.data.output["rgb"][0].detach().cpu().numpy().astype(np.uint8)
-            depth1 = cam1.data.output["distance_to_image_plane"][0]
-            rgb2 = cam2.data.output["rgb"][0].detach().cpu().numpy().astype(np.uint8)
-            depth2 = cam2.data.output["distance_to_image_plane"][0]
+            frames = {}
+            for name, cam in cams:
+                cam.update(dt)
+                rgb = cam.data.output["rgb"][0].detach().cpu().numpy().astype(np.uint8)
+                depth = cam.data.output["distance_to_image_plane"][0]
+                frames[name] = (rgb, depth)
 
             if step_count % args.log_interval == 0:
                 now = time.time()
                 elapsed = max(now - last_log_time, 1e-6)
                 steps_per_sec = args.log_interval / elapsed if step_count > 0 else 0.0
                 print(f"\n[Step {step_count}] approx_fps={steps_per_sec:.1f}")
-                print(
-                    f"  Cam1 RGB: shape={rgb1.shape}, range=[{rgb1.min()}, {rgb1.max()}], mean={rgb1.mean():.1f}"
-                )
-                print(f"  Cam1 Depth: {describe_depth(depth1)}")
-                print(
-                    f"  Cam2 RGB: shape={rgb2.shape}, range=[{rgb2.min()}, {rgb2.max()}], mean={rgb2.mean():.1f}"
-                )
-                print(f"  Cam2 Depth: {describe_depth(depth2)}")
+                for name, (rgb, depth) in frames.items():
+                    print(
+                        f"  {name} RGB: shape={rgb.shape}, range=[{rgb.min()}, {rgb.max()}], mean={rgb.mean():.1f}"
+                    )
+                    print(f"  {name} Depth: {describe_depth(depth)}")
                 last_log_time = now
 
             if args.save_images and step_count % args.save_interval == 0:
-                save_rgb_image(os.path.join(output_dir, f"cam1_step_{step_count:06d}.png"), rgb1)
-                save_rgb_image(os.path.join(output_dir, f"cam2_step_{step_count:06d}.png"), rgb2)
-                print(f"  [INFO] Saved cam1 + cam2 images for step {step_count} to {output_dir}")
+                for name, (rgb, _depth) in frames.items():
+                    save_rgb_image(os.path.join(output_dir, f"{name}_step_{step_count:06d}.png"), rgb)
+                print(f"  [INFO] Saved {' + '.join(cam_names)} images for step {step_count} to {output_dir}")
 
             obs, rewards, dones, _ = env.step(actions)
             step_count += 1

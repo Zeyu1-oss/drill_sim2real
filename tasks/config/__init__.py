@@ -1,6 +1,6 @@
 """
-环境配置文件
-包含不同配置的超参数设置
+Environment config files.
+Hyperparameter settings for different configs.
 """
 
 from .grasp_drill_env_cfg import HandHyperparametersCfg, DrillHyperparametersCfg

@@ -4,7 +4,7 @@ import os
 import sys
 from datetime import datetime
 
-# 添加项目根目录到路径
+# add project root to path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
 sys.path.insert(0, project_root)
 
@@ -15,39 +15,23 @@ def get_run_name():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="使用RL Games训练抓取电钻任务")
-    parser.add_argument("--headless", action="store_true", help="无头模式（关闭GUI）")
-    parser.add_argument("--device", type=str, default="cuda:0", help="设备")
-    parser.add_argument("--num_envs", type=int, default=256, help="并行环境数量")
-    parser.add_argument(
-        "--rl_config",
-        type=str,
-        default="config/agents/rl_games_ppo_cfg.yaml",
-        help="RL训练配置文件路径（默认: config/agents/rl_games_ppo_cfg.yaml）"
-    )
-    parser.add_argument(
-        "--config_preset",
-        type=str,
-        choices=["default", "small", "large"],
-        default="default",
-        help="使用预设配置: default, small, large"
-    )
-    parser.add_argument(
-        "--drill_config",
-        type=str,
-        default=None,
-        help="电钻配置文件路径（YAML格式）"
-    )
-    parser.add_argument("--checkpoint", type=str, default=None, help="加载检查点路径")
-    parser.add_argument("--play", action="store_true", help="仅播放模式（不训练）")
-    parser.add_argument("--run_name", type=str, default=None, help="自定义run名称（用于保存检查点）")
-    parser.add_argument("--debug", action="store_true", help="调试模式：只输出成功率，关闭其他日志")
-    parser.add_argument("--debug_interval", type=int, default=10, help="调试输出间隔（多少个episode）")
-    parser.add_argument("--joint_debug", action="store_true", help="关节调试模式：输出所有关节角度和动作详情")
-    parser.add_argument("--viz", action="store_true", help="点云可视化模式：在渲染器中显示采样的点云（需要 GUI）")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--num_envs', type=int, default=256)
+    parser.add_argument('--rl_config', type=str, default='config/agents/rl_games_ppo_cfg.yaml')
+    parser.add_argument('--config_preset', type=str, choices=['default', 'small', 'large'], default='default')
+    parser.add_argument('--drill_config', type=str, default=None)
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--play', action='store_true')
+    parser.add_argument('--run_name', type=str, default=None)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--debug_interval', type=int, default=10)
+    parser.add_argument('--joint_debug', action='store_true')
+    parser.add_argument('--viz', action='store_true')
     args = parser.parse_args()
 
-    # 确定RL配置文件路径
+    # determine the RL config file path
     if args.rl_config:
         rl_config_path = args.rl_config
     else:
@@ -58,10 +42,10 @@ def main():
         rl_config_path = os.path.join(project_root, "config/agents", config_filename)
 
     if not os.path.exists(rl_config_path):
-        print(f"错误: 配置文件不存在: {rl_config_path}")
+        print(f"error: config file not found: {rl_config_path}")
         sys.exit(1)
 
-    # 检查Isaac Lab导入
+    # check Isaac Lab import
     try:
         from isaaclab.app import AppLauncher
     except ImportError:
@@ -70,17 +54,17 @@ def main():
         except ImportError:
             sys.exit(1)
 
-    # 初始化应用
+    # init app
     app_launcher = AppLauncher(headless=args.headless, enable_cameras=False)
     simulation_app = app_launcher.app
 
     import omni.usd
     omni.usd.get_context().new_stage()
 
-    # 导入环境
+    # import env
     from tasks.grasp_drill_env import GraspDrillEnv, create_grasp_drill_env_cfg
 
-    # 创建环境配置
+    # create env config
     cfg = create_grasp_drill_env_cfg(
         num_envs=args.num_envs,
         device=args.device,
@@ -90,18 +74,18 @@ def main():
         enable_cameras=False,
     )
 
-    # 创建环境
+    # create env
     if args.debug:
-        print("[DEBUG] 调试模式：减少日志输出，仅显示成功率")
+        print("[DEBUG] debug mode: reduced logging, only showing success rate")
     env = GraspDrillEnv(cfg=cfg, debug=args.debug)
 
-    # 删除 /World/Template（在 env 创建之后删除）
+    # delete /World/Template (after env creation)
     from isaaclab.sim.utils import delete_prim
     try:
         delete_prim("/World/Template")
-        print("[INFO] 已删除 /World/Template")
+        print("[INFO] deleted /World/Template")
     except Exception as e:
-        print(f"[WARN] 删除 /World/Template 失败: {e}")
+        print(f"[WARN] failed to delete /World/Template: {e}")
 
     if args.viz:
         env.enable_pc_viz = True
@@ -115,9 +99,9 @@ def main():
         import torch
 
         # ======================================================================
-        # Monkey patch: 修复 GAE 计算中的 broadcast 问题
-        # 原始代码用 unsqueeze(1) 会导致 [N,1] broadcast 成 [T,N,N]
-        # 修复：用 view_as 保证 shape 一致，不做多余 unsqueeze
+        # Monkey patch: fix the broadcast issue in GAE computation
+        # the original code uses unsqueeze(1), causing [N,1] to broadcast into [T,N,N]
+        # fix: use view_as to keep shapes consistent, no extra unsqueeze
         # ======================================================================
         def _fixed_discount_values(self, fdones, last_extrinsic_values,
                                    mb_fdones, mb_extrinsic_values, mb_rewards):
@@ -210,7 +194,7 @@ def main():
                             if hasattr(value, 'item'):
                                 value = value.item()
                             self._pending_episode_rewards[key] = value
-                        print(f"[DEBUG] Episode奖励项: {list(self._pending_episode_rewards.keys())}")
+                        print(f"[DEBUG] Episode reward items: {list(self._pending_episode_rewards.keys())}")
 
                 return self._process_obs(obs_dict)
 
@@ -226,7 +210,7 @@ def main():
                 if hasattr(rew, 'numel'):
                     rew_nan = torch.isnan(rew).sum().item()
                     if rew_nan > 0:
-                        print(f"[WARN] 奖励包含 {rew_nan} NaN values!")
+                        print(f"[WARN] reward contains {rew_nan} NaN values!")
                         rew = torch.where(torch.isnan(rew), torch.zeros_like(rew), rew)
 
                 if isinstance(terminated, torch.Tensor):
@@ -288,8 +272,8 @@ def main():
                             processed_extras["episode"][k] = v
                     self._pending_episode_rewards = {}
 
-                # 真正的 epoch 级别 reward 打印由 DebugIsaacAlgoObserver.after_print_stats 处理
-                # wrapper 只做数据中转，不在这里打印 reward
+                # the real epoch-level reward printing is handled by DebugIsaacAlgoObserver.after_print_stats
+                # the wrapper only relays data, does not print reward here
                 return obs_and_states, rew, dones, processed_extras
 
     except ImportError as e:
@@ -297,7 +281,7 @@ def main():
     except ModuleNotFoundError as e:
         sys.exit(1)
 
-    # 加载 RL Games 配置
+    # load RL Games config
     import yaml
     with open(rl_config_path, "r") as f:
         rl_config = yaml.safe_load(f)
@@ -382,16 +366,16 @@ def main():
             self.ep_infos = []
             self.direct_info = {}
 
-            # normalize_input=False + model 已被 patch 跳过，跳过 NORM-RESET
+            # normalize_input=False + model already patched to skip, skip NORM-RESET
             pass
 
-            # 调试：打印 algo 所有属性，找到 env 路径
+            # debug: print all algo attributes to find the env path
             algo_attrs = [a for a in dir(algo) if not a.startswith('__')]
             print(f"\n  [DEBUG after_init] algo type: {type(algo).__name__}, attrs: {algo_attrs}")
 
             # ============================================================
-            # 修复：找到实际的 GraspDrillEnv 引用
-            # 层级链：algo.vec_env (RlGamesGpuEnv) → .env (RlGamesVecEnvWrapper) → .env (GraspDrillEnv)
+            # fix: find the actual GraspDrillEnv reference
+            # hierarchy: algo.vec_env (RlGamesGpuEnv) -> .env (RlGamesVecEnvWrapper) -> .env (GraspDrillEnv)
             # ============================================================
             self._cached_env = None
             try:
@@ -409,7 +393,7 @@ def main():
                             if inner2 is not None and hasattr(inner2, 'get_failure_stats'):
                                 self._cached_env = inner2
                             elif inner2 is not None:
-                                # 再深入一层
+                                # go one level deeper
                                 inner3 = getattr(inner2, 'unwrapped', None)
                                 if inner3 is not None and hasattr(inner3, 'get_failure_stats'):
                                     self._cached_env = inner3
@@ -421,12 +405,12 @@ def main():
                 if self._cached_env is not None:
                     print(f"  [DEBUG after_init] _cached_env = {type(self._cached_env).__name__} ✓")
                 else:
-                    print(f"  [DEBUG after_init] WARN: 无法找到有效的 _cached_env")
-                    # 最后的兜底：直接用 vec_env.env
+                    print(f"  [DEBUG after_init] WARN: could not find a valid _cached_env")
+                    # last-resort fallback: use vec_env.env directly
                     self._cached_env = getattr(vec_env, 'env', vec_env)
             except Exception as e:
                 import traceback
-                print(f"  [DEBUG after_init] 设置 _cached_env 失败: {e}")
+                print(f"  [DEBUG after_init] failed to set _cached_env: {e}")
                 traceback.print_exc()
             self._cached_env = None
 
@@ -448,13 +432,13 @@ def main():
             self.ep_infos.clear()
 
         def after_steps(self, *args, **kwargs):
-            # rl_games 每个 step 后调用，这里不需要处理
+            # called after each rl_games step, nothing to do here
             pass
 
         def after_print_stats(self, frame, epoch_num, total_time):
 
             if hasattr(self.algo, 'game_rewards') and self.algo.game_rewards.current_size > 0:
-                # 有真实完成的 episode，打印累计 reward
+                # has genuinely finished episodes, print cumulative reward
                 mean_reward = self.algo.game_rewards.get_mean()[0].item()
                 mean_shaped = self.algo.game_shaped_rewards.get_mean()[0].item()
                 mean_length = self.algo.game_lengths.get_mean().item()
@@ -469,19 +453,19 @@ def main():
                     self.writer.add_scalar("Episode/true_shaped_reward", mean_shaped, epoch_num)
                     self.writer.add_scalar("Episode/true_length", mean_length, epoch_num)
             else:
-                # 没有完整 episode，打印 horizon 级别的累计 reward
+                # no complete episode, print horizon-level cumulative reward
                 if hasattr(self.algo, 'current_rewards') and self.algo.current_rewards.numel() > 0:
                     step_reward_mean = self.algo.current_rewards.mean().item()
                     step_reward_std = self.algo.current_rewards.std().item()
                     step_reward_min = self.algo.current_rewards.min().item()
                     step_reward_max = self.algo.current_rewards.max().item()
                     print(f"\n{'='*60}")
-                    print(f"[Epoch {epoch_num}] Horizon 累计 Reward")
+                    print(f"[Epoch {epoch_num}] Horizon cumulative Reward")
                     print(f"  mean = {step_reward_mean:>10.4f}  std = {step_reward_std:>10.4f}")
                     print(f"  min  = {step_reward_min:>10.4f}  max = {step_reward_max:>10.4f}")
                     print(f"{'='*60}\n")
 
-            # 打印 episode extras（如 reward_approach, success_rate 等）
+            # print episode extras (e.g. reward_approach, success_rate, etc.)
             if self.ep_infos and self.writer is not None:
                 for key in list(self.ep_infos[0].keys()):
                     info_tensor = torch.tensor([], device=self.algo.device)
@@ -500,19 +484,19 @@ def main():
                     print(f"  [{key}] = {value.item():.6f}")
                 self.ep_infos.clear()
 
-            # 打印其他 direct info
+            # print other direct info
             if self.writer is not None:
                 for k, v in self.direct_info.items():
                     self.writer.add_scalar(f"{k}/frame", v, frame)
                     self.writer.add_scalar(f"{k}/iter", v, epoch_num)
                     self.writer.add_scalar(f"{k}/time", v, total_time)
 
-            # === 打印失败原因统计 ===
+            # === print failure-reason stats ===
             try:
-                # 使用在 after_init 中缓存的 env 引用
+                # use the env reference cached in after_init
                 env_obj = self._cached_env
                 if env_obj is None:
-                    # 兜底：重新尝试遍历
+                    # fallback: retry traversal
                     vec_env = getattr(self.algo, 'vec_env', None)
                     if vec_env is not None:
                         candidate = getattr(vec_env, 'env', None)
@@ -524,24 +508,24 @@ def main():
                                 env_obj = getattr(candidate, 'env', None)
 
                 if env_obj is None:
-                    print(f"\n  [Failure Stats] WARN: _cached_env is None (env 引用未正确缓存)")
+                    print(f"\n  [Failure Stats] WARN: _cached_env is None (env reference not cached correctly)")
                 elif not hasattr(env_obj, 'get_failure_stats'):
-                    print(f"\n  [Failure Stats] WARN: {type(env_obj).__name__} 没有 get_failure_stats 方法")
+                    print(f"\n  [Failure Stats] WARN: {type(env_obj).__name__} has no get_failure_stats method")
                 else:
                         failure_stats = env_obj.get_failure_stats()
                         total = failure_stats.get("total", 0)
                         print(f"\n  [Failure Stats] (n={total}) [{type(env_obj).__name__}]")
                         for reason, count in failure_stats.items():
-                            # 汇总行单独格式化打印，不走循环
+                            # format and print the summary row separately, not in the loop
                             if reason in ("total", "failure_count", "physics_nan",
                                           "normal_total", "lenient_success_count"):
                                 continue
-                            # 自适应：值为 None 表示该 failure 原因从未触发（被注释掉），不打印
+                            # adaptive: a None value means this failure reason never triggered (commented out), not printed
                             if count is None:
                                 continue
                             print(f"    {reason:<28s}: {int(count):>6}")
 
-                        # 汇总行
+                        # summary row
                         print(f"    {'total':<28s}: {int(total):>6}")
                         print(f"    {'failure_count':<28s}: {int(failure_stats.get('failure_count', 0)):>6}")
                         print(f"    {'physics_nan':<28s}: {int(failure_stats.get('physics_nan', 0)):>6}")
@@ -555,7 +539,7 @@ def main():
 
     try:
         algo_observer = DebugIsaacAlgoObserver()
-        # Runner 没有 set_algo_observer 方法，直接赋值属性
+        # Runner has no set_algo_observer method, assign the attribute directly
         runner.algo_observer = algo_observer
     except Exception as e:
         pass
@@ -570,7 +554,7 @@ def main():
     if load_checkpoint and load_path and os.path.exists(load_path):
         import torch
         try:
-            print(f"\n正在预处理检查点: {load_path}")
+            print(f"\npreprocessing checkpoint: {load_path}")
             checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
 
 
@@ -585,21 +569,21 @@ def main():
     }
 
     if load_checkpoint and load_path:
-        print(f"\n从检查点加载: {load_path}")
+        print(f"\nloading from checkpoint: {load_path}")
     elif load_checkpoint:
-        print("\nload_checkpoint=True 但 load_path 为空，将从头训练")
+        print("\nload_checkpoint=True but load_path is empty, training from scratch")
 
     print_frequency = 1
     rl_config["params"]["config"]["print_stats_frequency"] = print_frequency
-    print(f"\n每个 Epoch 结束时打印训练统计")
+    print(f"\nprint training stats at the end of each Epoch")
 
     if args.play:
-        print("\n开始播放模式...")
+        print("\nstarting playback mode...")
     else:
         if args.debug:
-            print("\n开始训练... (调试模式)")
+            print("\nstarting training... (debug mode)")
         else:
-            print("开始训练...")
+            print("starting training...")
         print("=" * 60)
 
     try:
@@ -638,22 +622,22 @@ def main():
 
         runner.run(train_params)
     except KeyboardInterrupt:
-        print("\n\n用户中断，停止训练...")
+        print("\n\nuser interrupt, stopping training...")
     except Exception as e:
-        print(f"\n错误: {e}")
+        print(f"\nerror: {e}")
         import traceback
         traceback.print_exc()
 
     if cleaned_checkpoint_path and os.path.exists(cleaned_checkpoint_path):
         try:
             os.remove(cleaned_checkpoint_path)
-            print(f"\n临时检查点已清理: {cleaned_checkpoint_path}")
+            print(f"\ntemp checkpoint cleaned: {cleaned_checkpoint_path}")
         except:
             pass
 
     env.close()
     simulation_app.close()
-    print("\n完成！")
+    print("\ndone!")
 
 
 if __name__ == "__main__":

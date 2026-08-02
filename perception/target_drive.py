@@ -1,16 +1,19 @@
-"""统一的 target 直接驱动 —— collect / deploy / play 共用,保证三处动力学逐字节一致。
+"""Unified direct target drive -- shared by collect / deploy / play so dynamics are
+byte-for-byte identical across all three.
 
-env._apply_action 天生只懂 raw([-1,1] 绝对映射 + EMA + 限速 + 饱和)。本模块把它
-monkeypatch 成"直接下发关节目标角 q*",从而:
-  - deploy:DP3 直接输出 q* → 直接下发,不再走 target→raw 逆映射(逆映射会放大手臂动作、易乱动)。
-  - collect/play:teacher/MLP 出 raw → raw_to_target 换成 q* → 直接下发。
+env._apply_action natively only understands raw ([-1,1] absolute mapping + EMA + rate
+limit + saturation). This module monkeypatches it to directly command joint target
+angles q*, so that:
+  - deploy: DP3 outputs q* directly -> commanded directly, no target->raw inverse mapping
+    (the inverse mapping amplifies arm motion and tends to jitter).
+  - collect/play: teacher/MLP output raw -> raw_to_target converts to q* -> commanded directly.
 
-三处用同一份代码,采集↔部署动力学完全一致。
+All three use the same code, so collect and deploy dynamics match exactly.
 
 API:
-  p = install_direct_drive(env_unwrapped)            # monkeypatch,返回 DriveParams
-  env_unwrapped._direct_target = q_star              # deploy:DP3 的 q*
-  env_unwrapped._direct_target = raw_to_target(a, cur0, p)   # collect/play:raw→q*
+  p = install_direct_drive(env_unwrapped)            # monkeypatch, returns DriveParams
+  env_unwrapped._direct_target = q_star              # deploy: DP3's q*
+  env_unwrapped._direct_target = raw_to_target(a, cur0, p)   # collect/play: raw->q*
 """
 import types
 
@@ -18,7 +21,7 @@ import torch
 
 
 class DriveParams:
-    """从 env 一次性读出驱动所需常量(与 env._apply_action 同一真源)。"""
+    """Read the drive constants from env once (same source as env._apply_action)."""
 
     def __init__(self, env_unwrapped):
         self.s = float(env_unwrapped.action_smoothing)
@@ -37,11 +40,12 @@ class DriveParams:
 
 
 def raw_to_target(a, cur0, p):
-    """复刻 env._apply_action 前向(EMA+限速+饱和,n_sub 子步):raw 动作 a → 关节目标角 q*。
+    """Replicate env._apply_action forward (EMA+rate-limit+saturation, n_sub substeps):
+    raw action a -> joint target angles q*.
 
-    a:    (B, 13) raw 动作 [-1,1];前 n_arm 维为手臂绝对位置,余为手指增量。
-    cur0: (B, 13) step 前的 cur_targets。
-    返回: (B, 13) 这个 a 本来会让 cur_targets 到达的目标角 q*。
+    a:    (B, 13) raw action [-1,1]; first n_arm dims are arm absolute position, rest are finger deltas.
+    cur0: (B, 13) cur_targets before step.
+    return: (B, 13) target angles q* this a would have driven cur_targets to.
     """
     na, s, mjd, mfd = p.n_arm, p.s, p.max_joint_delta, p.max_finger_delta
     cur = cur0.clone()
@@ -59,20 +63,26 @@ def raw_to_target(a, cur0, p):
 
 
 def smooth_labels_forward(actions, k: int):
-    """动作标签前向滑动平均: new_a[t] = mean(a[t : t+k])(窗口在 episode 尾部自动收缩)。
+    """Forward moving average of action labels: new_a[t] = mean(a[t : t+k])
+    (window shrinks automatically at the episode tail).
 
-    为什么需要:teacher(RL)的 cur_targets 是贴限速上限的 PWM 抖动
-    (每步 ±max_joint_delta、方向近随机翻转,实测 95% 步贴 0.02 上限、翻转率 ~43%)。
-    对 BC 这是不可预测的标签噪声:误差地板 ≈ 抖动幅度,学习信号被稀释 ~7 倍。
-    前向均值把零均值抖动平均掉(k=8 -> 残余 ~0.02/√8 ≈ 0.007 rad),同时:
-      - 握力/抗重力的直流偏置(target 比实测位置深的系统差)完整保留;
-      - 平滑后逐步增量 |Δ| ≤ 原限速包络(均值的差 ≤ 差的均值),部署直接可执行;
-      - 前向窗口自带 ~k/2 步超前,顺便抵消"标签晚一步"的时序约定。
+    Why needed: the teacher's (RL) cur_targets is rate-limit-saturated PWM jitter
+    (each step +/-max_joint_delta, near-random sign flips; measured 95% of steps hit the 0.02
+    limit, ~43% flip rate). For BC this is unpredictable label noise: the error floor ~ jitter
+    amplitude, diluting the learning signal ~7x. Forward mean averages out the zero-mean jitter
+    (k=8 -> residual ~0.02/sqrt(8) ~ 0.007 rad), while:
+      - the DC bias for grip force / anti-gravity (target deeper than measured position) is fully kept;
+      - after smoothing the per-step delta |d| <= original rate-limit envelope (mean of diffs <= diff
+        of means), directly executable at deploy;
+      - the forward window carries ~(k-1)/2 steps of lead: for old-gen data (action shifted one row)
+        it conveniently cancels the "label one step late"; for new-gen official-timing data
+        (collect from 2026-07-16) it is pure lead, so deploy lag_comp should be 0 and beware that a
+        too-large k makes the action run ahead of the observation.
 
-    单一真源:collect_dp3_data.py(采集时平滑)、deploy 的 DeployCollector、
-    tools/relabel_smooth_actions.py(离线重标注)都用本函数,保证三处逐字节一致。
+    Single source: collect_dp3_data.py (smooth at collection time) and
+    tools/relabel_smooth_actions.py (offline relabel) both use this function, byte-for-byte identical.
 
-    actions: (T, D) numpy 数组;k<=1 时原样返回。
+    actions: (T, D) numpy array; returned unchanged when k<=1.
     """
     import numpy as np
     actions = np.asarray(actions)
@@ -87,22 +97,54 @@ def smooth_labels_forward(actions, k: int):
     return out.astype(np.float32)
 
 
-def install_direct_drive(env_unwrapped):
-    """monkeypatch env._apply_action,使每子步直接下发 env._direct_target(跳过 raw 解释/逆映射)。
+def install_direct_drive(env_unwrapped, rate_limit: bool = False):
+    """monkeypatch env._apply_action so each substep directly commands env._direct_target
+    (skipping raw interpretation / inverse mapping).
 
-    调用后,每个控制步在 step 前设置 env_unwrapped._direct_target 即可:
-        deploy:       env._direct_target = q_star(DP3 直接输出)
+    After calling, set env_unwrapped._direct_target before step each control step:
+        deploy:       env._direct_target = q_star (DP3 direct output)
         collect/play:  env._direct_target = raw_to_target(a, cur0, p)
-    返回 DriveParams(collect/play 算 q* 用;deploy 不需要)。
+    Returns DriveParams (for collect/play to compute q*; deploy does not need it).
+
+    rate_limit: apply the SAME per-substep slew limit raw_to_target uses (+/-max_joint_delta on the
+        arm, +/-max_finger_delta on the fingers) to _direct_target before commanding it.
+        Off by default -- with it off this function behaves exactly as before.
+
+        Why it exists: training labels are produced by raw_to_target, which clamps the increment
+        once per substep, so a label sequence can move at most n_sub*max_delta per control step
+        (measured: arm 0.02 rad, fingers 0.06, with 0.00% of training steps exceeding it). DP3
+        outputs q* directly and never passes through raw_to_target, so nothing bounds its step size
+        at deploy: measured 15-26% of deployed arm steps exceed 0.02, up to 0.327 rad (16x) in one
+        1/60 s control step. Enabling this puts the executed target sequence back inside the
+        dynamics the policy was trained on. It is a no-op for any target that already complies
+        (collect / RL-teacher paths), so it only ever affects the DP3 path.
     """
     p = DriveParams(env_unwrapped)
     jl, ju = p.jl, p.ju
 
+    # ---- rate limit (removable block: delete this + the `if rate_limit` line below + the arg) ----
+    _cap = None
+    if rate_limit:
+        _n_all = int(jl.shape[0])
+        _cap = torch.cat([
+            torch.full((p.n_arm,), p.max_joint_delta, device=jl.device, dtype=jl.dtype),
+            torch.full((_n_all - p.n_arm,), p.max_finger_delta, device=jl.device, dtype=jl.dtype),
+        ]).unsqueeze(0)
+        print(f"[RATE-LIMIT] direct-drive slew limit ON: arm +/-{p.max_joint_delta} "
+              f"finger +/-{p.max_finger_delta} per substep (x{p.n_sub} substeps = "
+              f"{p.max_joint_delta * p.n_sub:.3f}/{p.max_finger_delta * p.n_sub:.3f} per control step), "
+              f"matching raw_to_target", flush=True)
+
     def _apply_action_direct(self):
-        tgt = torch.max(torch.min(self._direct_target, ju.unsqueeze(0)), jl.unsqueeze(0))
+        tgt = self._direct_target
+        if _cap is not None:
+            # same shape as raw_to_target: clamp the increment once per substep, so two substeps
+            # accumulate to at most 2*cap -- identical to the training-label generation path
+            tgt = torch.max(torch.min(tgt, self.cur_targets + _cap), self.cur_targets - _cap)
+        tgt = torch.max(torch.min(tgt, ju.unsqueeze(0)), jl.unsqueeze(0))
         self.cur_targets = tgt
         self.franka.set_joint_position_target(tgt, joint_ids=self.controlled_joint_indices)
 
     env_unwrapped._apply_action = types.MethodType(_apply_action_direct, env_unwrapped)
-    env_unwrapped._direct_target = env_unwrapped.cur_targets.clone()   # 占位,首 step 前先给合法值
+    env_unwrapped._direct_target = env_unwrapped.cur_targets.clone()   # placeholder, legal value before first step
     return p

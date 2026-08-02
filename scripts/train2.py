@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Stage2 训练脚本：从 Stage1 成功的抓取姿态出发，训练将电钻对齐到目标坐标系。
-数据来源：collect_success_data.py 生成的 success_data.pkl
+Stage2 training script: starting from Stage1's successful grasp poses, train to align the drill to a target frame.
+Data source: success_data.pkl produced by collect_success_data.py
 """
 
 import argparse
@@ -66,22 +66,20 @@ def main():
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
     sys.path.insert(0, project_root)
 
-    parser = argparse.ArgumentParser(description="Stage2 训练 - 从 success_data.pkl 加载姿态，对齐电钻到目标坐标系")
-    parser.add_argument("--headless", action="store_true", help="无头模式")
-    parser.add_argument("--device", type=str, default="cuda:0", help="设备")
-    parser.add_argument("--num_envs", type=int, default=4096, help="并行环境数量")
-    parser.add_argument("--dataset", type=str, default="collected_data/success_data.pkl", help="success_data.pkl 路径")
-    parser.add_argument("--rl_config", type=str, default="config/agents/rl_games_ppo_cfg.yaml", help="RL配置")
-    parser.add_argument("--checkpoint", type=str, default=None, help="加载检查点（Stage1 权重）")
-    parser.add_argument("--run_name", type=str, default=None, help="run名称")
-    parser.add_argument("--target_pos", type=float, nargs=3, default=[0.0, 0.0, 0.85],
-                        help="目标位置 (x y z)，单位米")
-    parser.add_argument("--target_quat", type=float, nargs=4, default=[1.0, 0.0, 0.0, 0.0],
-                        help="目标旋转 (w x y z)，单位四元数")
-    parser.add_argument("--debug", action="store_true", help="开启 debug 可视化")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--num_envs', type=int, default=4096)
+    parser.add_argument('--dataset', type=str, default='collected_data/success_data.pkl')
+    parser.add_argument('--rl_config', type=str, default='config/agents/rl_games_ppo_cfg.yaml')
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--run_name', type=str, default=None)
+    parser.add_argument('--target_pos', type=float, nargs=3, default=[0.0, 0.0, 0.85])
+    parser.add_argument('--target_quat', type=float, nargs=4, default=[1.0, 0.0, 0.0, 0.0])
+    parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
-    # 先导入 AppLauncher，再导入 isaaclab 相关模块
+    # import AppLauncher first, then the isaaclab modules
     try:
         from isaaclab.app import AppLauncher
     except ImportError:
@@ -90,13 +88,13 @@ def main():
     app_launcher = AppLauncher(headless=args.headless)
     simulation_app = app_launcher.app
 
-    # 初始化数据集
+    # init dataset
     success_dataset = get_success_dataset(args.dataset, args.device)
 
-    # 获取 Stage2Env 类（在 AppLauncher 之后才可导入）
+    # get the Stage2Env class (importable only after AppLauncher)
     Stage2Env = get_stage2_env_class()
 
-    print(f"[Stage2] 目标位置: {args.target_pos}  目标旋转: {args.target_quat}")
+    print(f"[Stage2] target position: {args.target_pos}  target rotation: {args.target_quat}")
 
     cfg = create_stage2_env_cfg(
         num_envs=args.num_envs,
@@ -113,13 +111,13 @@ def main():
         debug=args.debug,
     )
 
-    # 删除模板 prim（避免视觉干扰）
+    # delete the template prim (avoid visual clutter)
     from isaaclab.sim.utils import delete_prim
     try:
         delete_prim("/World/Template")
-        print("[INFO] 已删除 /World/Template")
+        print("[INFO] deleted /World/Template")
     except Exception as e:
-        print(f"[WARN] 删除 /World/Template 失败: {e}")
+        print(f"[WARN] failed to delete /World/Template: {e}")
 
     from rl_games.common import env_configurations, vecenv
     from rl_games.common.algo_observer import IsaacAlgoObserver
@@ -189,7 +187,7 @@ def main():
             if hasattr(rew, 'numel'):
                 rew_nan = torch.isnan(rew).sum().item()
                 if rew_nan > 0:
-                    print(f"[WARN] 奖励包含 {rew_nan} NaN values!")
+                    print(f"[WARN] reward contains {rew_nan} NaN values!")
                     rew = torch.where(torch.isnan(rew), torch.zeros_like(rew), rew)
 
             if isinstance(terminated, torch.Tensor):
@@ -205,9 +203,9 @@ def main():
                                                  device=self._sim_device)
 
             if not self.unwrapped.cfg.is_finite_horizon:
-                # time_outs = 超时截断的那一步(与官方 wrapper / stage1 写法一致)。
-                # 之前误写成 ~truncated:value_bootstrap 在几乎每一步都加 γ·V,
-                # V 指数爆炸 → 参数 NaN → "normal expects all elements of std >= 0"。
+                # time_outs = the timeout-truncated step (consistent with the official wrapper / stage1).
+                # previously mis-written as ~truncated: value_bootstrap adds gamma*V at almost every step,
+                # V explodes exponentially -> params NaN -> \"normal expects all elements of std >= 0\".
                 time_outs = truncated_bool.to(dtype=torch.float32)
                 if time_outs.dim() > 1:
                     time_outs = time_outs.squeeze(-1)
@@ -294,13 +292,13 @@ def main():
                 if self._cached_env is not None:
                     print(f"  [Stage2] _cached_env = {type(self._cached_env).__name__}")
                 else:
-                    print(f"  [Stage2] WARN: 无法找到有效的 _cached_env")
+                    print(f"  [Stage2] WARN: could not find a valid _cached_env")
                     self._cached_env = getattr(vec_env, 'env', vec_env)
             except Exception as e:
                 import traceback
-                print(f"  [Stage2] _cached_env 设置失败: {e}")
+                print(f"  [Stage2] _cached_env set failed: {e}")
                 traceback.print_exc()
-            # ↑ 不要在这里写 self._cached_env = None！
+            # ^ do not write self._cached_env = None here!
 
         def process_infos(self, infos, done_indices):
             if not isinstance(infos, dict):
@@ -345,7 +343,7 @@ def main():
                     step_reward_min = self.algo.current_rewards.min().item()
                     step_reward_max = self.algo.current_rewards.max().item()
                     print(f"\n{'='*60}")
-                    print(f"[Epoch {epoch_num}] Horizon 累计 Reward")
+                    print(f"[Epoch {epoch_num}] Horizon cumulative Reward")
                     print(f"  mean = {step_reward_mean:>10.4f}  std = {step_reward_std:>10.4f}")
                     print(f"  min  = {step_reward_min:>10.4f}  max = {step_reward_max:>10.4f}")
                     print(f"{'='*60}\n")
@@ -368,7 +366,7 @@ def main():
                     print(f"  [{key}] = {value.item():.6f}")
                 self.ep_infos.clear()
 
-            # ── 直接从 env 拿当前 reward 分量均值写 TensorBoard ──
+            # -- take the current mean reward components directly from env and write to TensorBoard --
             if self.writer is not None and self._cached_env is not None:
                 env_obj = self._cached_env
                 log_data = getattr(env_obj, 'extras', {}).get('log', {})
@@ -398,9 +396,9 @@ def main():
                                 env_obj = getattr(candidate, 'env', None)
 
                 if env_obj is None:
-                    print(f"\n  [Failure Stats] WARN: _cached_env is None (env 引用未正确缓存)")
+                    print(f"\n  [Failure Stats] WARN: _cached_env is None (env reference not cached correctly)")
                 elif not hasattr(env_obj, '_get_rewards'):
-                    print(f"\n  [Failure Stats] WARN: {type(env_obj).__name__} 没有 _get_rewards 方法")
+                    print(f"\n  [Failure Stats] WARN: {type(env_obj).__name__} has no _get_rewards method")
                 else:
                     failure_stats = env_obj.get_failure_stats()
                     total = failure_stats.get("total", 0)
@@ -494,15 +492,15 @@ def main():
         load_path = args.checkpoint
         load_checkpoint = True
 
-    # ── Stage1 checkpoint 观测维度扩展 ──────────────────────────────
-    # stage2 观测 = stage1 观测 + plate 位姿 7 维(pos3+quat4)。stage1 权重的输入层按新增列
-    # 零填充(零权重 → 初始行为与 stage1 完全一致,plate 维度从 0 学起);
-    # 优化器状态(exp_avg 等)中同形状张量一并填充,避免首次 update 形状不匹配。
+    # -- Stage1 checkpoint observation-dim extension --------------------------------
+    # stage2 obs = stage1 obs + plate pose 7 dims (pos3+quat4). The stage1 weights' input layer is
+    # zero-padded on the new columns (zero weights -> initial behavior identical to stage1, plate dims learned from 0);
+    # same-shape tensors in the optimizer state (exp_avg etc.) are padded too, avoiding a shape mismatch on the first update.
     cleaned_checkpoint_path = None
     if load_checkpoint and load_path and os.path.exists(load_path):
         try:
-            print(f"\n正在预处理检查点: {load_path}")
-            new_dim = int(cfg.observation_space)   # Stage2Env.__init__ 已把 cfg 改为 +6
+            print(f"\npreprocessing checkpoint: {load_path}")
+            new_dim = int(cfg.observation_space)   # Stage2Env.__init__ already changed cfg to +6
             checkpoint = torch.load(load_path, map_location='cpu', weights_only=False)
 
             old_dim = None
@@ -515,7 +513,7 @@ def main():
                 pad = new_dim - old_dim
 
                 def _pad_tree(node):
-                    """递归零填充 checkpoint 树中所有 [*, old_dim] 的 2 维张量。"""
+                    """Recursively zero-pad all 2D [*, old_dim] tensors in the checkpoint tree."""
                     n = 0
                     if isinstance(node, dict):
                         for kk in list(node.keys()):
@@ -535,16 +533,16 @@ def main():
                 cleaned_checkpoint_path = load_path + f".obs{new_dim}.tmp.pth"
                 torch.save(checkpoint, cleaned_checkpoint_path)
                 load_path = cleaned_checkpoint_path
-                print(f"  [CKPT] 观测 {old_dim} -> {new_dim}: 零填充 {n_padded} 个张量"
-                      f"(输入层权重 + 优化器动量),临时文件: {cleaned_checkpoint_path}")
+                print(f"  [CKPT] obs {old_dim} -> {new_dim}: zero-padded {n_padded} tensors"
+                      f"(input-layer weights + optimizer momentum), temp file: {cleaned_checkpoint_path}")
             elif old_dim == new_dim:
-                print(f"  [CKPT] 观测维度一致({new_dim}),直接加载")
+                print(f"  [CKPT] obs dim matches ({new_dim}), loading directly")
             else:
-                print(f"  [CKPT] 未识别输入层维度(old={old_dim}),按原样加载")
+                print(f"  [CKPT] input-layer dim not recognized (old={old_dim}), loading as-is")
         except Exception as e:
             import traceback
             traceback.print_exc()
-            print(f"  [CKPT] 预处理失败,按原样加载: {e}")
+            print(f"  [CKPT] preprocessing failed, loading as-is: {e}")
 
     train_params = {
         "train": True,
@@ -554,24 +552,24 @@ def main():
     }
 
     if load_checkpoint and load_path:
-        print(f"\n从检查点加载: {load_path}")
+        print(f"\nloading from checkpoint: {load_path}")
     elif load_checkpoint:
-        print("\nload_checkpoint=True 但 load_path 为空，将从头训练")
+        print("\nload_checkpoint=True but load_path is empty, training from scratch")
 
     rl_config["params"]["config"]["print_stats_frequency"] = 1
-    print(f"\n每个 Epoch 结束时打印训练统计")
+    print(f"\nprint training stats at the end of each Epoch")
 
-    print(f"\n[Stage2] 开始训练")
-    print(f"  - 样本数量: {len(success_dataset)}")
-    print(f"  - 环境数量: {args.num_envs}")
-    print(f"  - 目标位置: {args.target_pos}")
-    print(f"  - 目标旋转: {args.target_quat}")
-    print(f"  - Run名称: {run_name}")
+    print(f"\n[Stage2] start training")
+    print(f"  - sample count: {len(success_dataset)}")
+    print(f"  - env count: {args.num_envs}")
+    print(f"  - target position: {args.target_pos}")
+    print(f"  - target rotation: {args.target_quat}")
+    print(f"  - Run name: {run_name}")
     if args.checkpoint:
-        print(f"  - 加载检查点: {args.checkpoint}")
+        print(f"  - load checkpoint: {args.checkpoint}")
 
     try:
-        # ⚠️ 必须在 runner.load() 之前设置 algo_observer，否则会被 DefaultAlgoObserver 覆盖
+        # WARNING: must set algo_observer before runner.load(), else DefaultAlgoObserver overrides it
         runner.algo_observer = algo_observer
         runner.load(rl_config)
 
@@ -608,22 +606,22 @@ def main():
 
         runner.run(train_params)
     except KeyboardInterrupt:
-        print("\n用户中断")
+        print("\nuser interrupt")
     except Exception as e:
-        print(f"错误: {e}")
+        print(f"error: {e}")
         import traceback
         traceback.print_exc()
 
     if cleaned_checkpoint_path and os.path.exists(cleaned_checkpoint_path):
         try:
             os.remove(cleaned_checkpoint_path)
-            print(f"\n临时检查点已清理: {cleaned_checkpoint_path}")
+            print(f"\ntemp checkpoint cleaned: {cleaned_checkpoint_path}")
         except:
             pass
 
     env.close()
     simulation_app.close()
-    print("完成！")
+    print("done!")
 
 
 if __name__ == "__main__":

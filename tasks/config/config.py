@@ -1,6 +1,6 @@
 """
-超参数配置文件
-集中管理所有超参数，方便调整和实验
+Hyperparameter config file.
+Central place for all hyperparameters, for easy tuning and experiments.
 """
 
 from dataclasses import dataclass
@@ -12,71 +12,69 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RewardHyperparameters:
-    """奖励函数超参数 - 参考 RobustDexGrasp 设计"""
+    """Reward hyperparameters - based on RobustDexGrasp."""
 
 
-    finger_reward_scale: float = 3.0      # 手指奖励最大值
-    finger_temperature: float = 0.05      # 手指温度参数（5cm 内奖励明显）
+    finger_reward_scale: float = 3.0      # max finger reward
+    finger_temperature: float = 0.05      # finger temperature (clear reward within 5cm)
 
-    palm_penalty_scale: float = 0.5       # 手掌惩罚系数（增大手掌阻挡惩罚）
-    palm_temperature: float = 0.5       # 手掌惩罚温度（手掌可稍微远离 drill）
+    palm_penalty_scale: float = 0.5       # palm penalty scale (stronger palm-blocking penalty)
+    palm_temperature: float = 0.5       # palm penalty temperature (palm may stay a bit away from drill)
 
-    # === 接触奖励（参考 RobustDexGrasp）===
-    contact_reward_scale: float = 5.0     # 接触奖励权重
-    contact_threshold: float = 0.03       # 接触判定距离（3cm）
+    # === contact reward (based on RobustDexGrasp) ===
+    contact_reward_scale: float = 5.0     # contact reward weight
+    contact_threshold: float = 0.03       # contact distance threshold (3cm)
 
-    # === 对齐奖励 ===
-    alignment_reward_scale: float = 0.5   # 对齐奖励权重
+    # === alignment reward ===
+    alignment_reward_scale: float = 0.5   # alignment reward weight
 
-    # === 抬起奖励 ===
-    lift_height: float = 0.05            # 抬起高度阈值（10cm）- 与 lift_z_threshold 对应
-    lift_reward_weight: float = 1      # 抬起奖励权重（指数增长，需要小权重防止 NaN）
-    success_reward_weight: float = 10.0   # 成功奖励权重
+    # === lift reward ===
+    lift_height: float = 0.05            # lift height threshold (10cm) - matches lift_z_threshold
+    lift_reward_weight: float = 1      # lift reward weight (exponential growth, small weight to avoid NaN)
+    success_reward_weight: float = 10.0   # success reward weight
 
-    # === 稳定性奖励（参考 RobustDexGrasp）===
-    velocity_reward_weight: float = 0.1   # 线速度惩罚权重
-    angular_velocity_reward_weight: float = 0.05  # 角速度惩罚权重
+    # === stability reward (based on RobustDexGrasp) ===
+    velocity_reward_weight: float = 0.1   # linear velocity penalty weight
+    angular_velocity_reward_weight: float = 0.05  # angular velocity penalty weight
 
     object_lin_vel_penalty: float = -15.0
     object_ang_vel_penalty: float = -0.5
-    object_max_lin_vel: float = 0.3        # 最大允许线速度 (m/s)
-    object_max_ang_vel: float = 1.0        # 最大允许角速度 (rad/s)
-
+    object_max_lin_vel: float = 0.3        # max allowed linear velocity (m/s)
+    object_max_ang_vel: float = 1.0        # max allowed angular velocity (rad/s)
 
 
 
 
 @dataclass
 class TerminationHyperparameters:
-    """终止条件超参数"""
+    """Termination hyperparameters."""
 
-    lift_z_threshold: float = 0.2  # 10cm - 抬起超过10cm判定成功
-    fall_dist: float = 0.10  # 下降超过10cm才判定失败，必须小于初始高度 0.15m
-
+    lift_z_threshold: float = 0.2  # 10cm - success when lifted more than 10cm
+    fall_dist: float = 0.10  # failure only when dropped more than 10cm, must be < initial height 0.15m
 
 
 @dataclass
 class ActionHyperparameters:
-    """动作超参数"""
+    """Action hyperparameters."""
 
-    # 动作缩放步长
-    wrist_pos_scale: float = 0.005     # 手腕位置每次变化（米）
-    wrist_euler_scale: float = 0.05    # 手腕姿态每次变化（弧度）
-    joint_pos_scale: float = 0.85      # 关节位置每次变化（弧度，action -1~1 覆盖整个关节范围）
+    # action scaling step
+    wrist_pos_scale: float = 0.005     # wrist position change per step (m)
+    wrist_euler_scale: float = 0.05    # wrist orientation change per step (rad)
+    joint_pos_scale: float = 0.85      # joint position change per step (rad; action -1~1 covers full joint range)
 
-    action_penalty_weight: float = -0.0002  # 负权重 = 惩罚
-    action_penalty_scale: float = 0.0002    # 惩罚缩放因子
+    action_penalty_weight: float = -0.0002  # negative weight = penalty
+    action_penalty_scale: float = 0.0002    # penalty scale factor
 
 
 @dataclass
 class SimulationHyperparameters:
-    """仿真超参数"""
+    """Simulation hyperparameters."""
 
     dt: float = 1/120
-    decimation: int = 4 
-    episode_length_s: float = 10.0  
+    decimation: int = 2
+    episode_length_s: float = 10.0
 
-    # PhysX 参数o
+    # PhysX params
     bounce_threshold_velocity: float = 0.01
     gpu_found_lost_aggregate_pairs_capacity: int = 1024 * 1024 * 4
     gpu_total_aggregate_pairs_capacity: int = 16 * 1024
@@ -97,7 +95,7 @@ class SimulationHyperparameters:
 
 @dataclass
 class HandHyperparameters:
-    """灵巧手超参数"""
+    """Dexterous hand hyperparameters."""
 
     effort_limit_sim: float = 10.0
     velocity_limit_sim: float = 10.0
@@ -112,9 +110,9 @@ class HandHyperparameters:
 
 @dataclass
 class DrillHyperparameters:
-    """电钻超参数"""
+    """Drill hyperparameters."""
 
-    # 物理属性
+    # physics
     mass: float = 1
     scale: Tuple[float, float, float] = (1, 1, 1)
 
@@ -123,23 +121,23 @@ class DrillHyperparameters:
 
     contact_offset: float = 0.005
     rest_offset: float = 0
-    max_depenetration_velocity: float = 10.0  # 限制穿透解算瞬间甩出的速度（原 10 偏大）
+    max_depenetration_velocity: float = 10.0
 
     table_height: float = 0.6
 
-    # 求解器参数
+    # solver params
     solver_position_iteration_count: int = 64  #
     solver_velocity_iteration_count: int = 1  #
-    max_angular_velocity: float = 50.0   # 原 1000 形同不限；钻头正常运动远低于此
-    max_linear_velocity: float = 10.0     # 原 1000；被打飞也不该超过 ~10 m/s
+    max_angular_velocity: float = 50.0
+    max_linear_velocity: float = 10.0     # was 1000; even when knocked away should not exceed ~10 m/s
 
 
 @dataclass
 class SceneHyperparameters:
 
-    env_spacing: float = 3.0  # 
-    replicate_physics: bool = True  # 
-    clone_in_fabric: bool = False  # 
+    env_spacing: float = 3.0  #
+    replicate_physics: bool = True  #
+    clone_in_fabric: bool = False  #
 
 
 @dataclass
@@ -147,15 +145,15 @@ class RandomizationHyperparameters:
 
     enable_randomization: bool = True
 
-    joint_pos_noise_std: float = 0.002  
-    joint_vel_noise_std: float = 0.001 
+    joint_pos_noise_std: float = 0.002
+    joint_vel_noise_std: float = 0.001
 
-    action_noise_std: float = 0.05  
+    action_noise_std: float = 0.05
 
-    drill_pos_random_range: Tuple[float, float, float] = (0.05, 0.05, 0.00) 
-    drill_rot_random_range: Tuple[float, float, float] = (0, 0, 1)  
+    drill_pos_random_range: Tuple[float, float, float] = (0.15, 0.15, 0.00)
+    drill_rot_random_range: Tuple[float, float, float] = (0, 0, 1)
 
-    gravity_bias_range: Tuple[float, float, float] = (0.0, 0.0, 0.4)  
+    gravity_bias_range: Tuple[float, float, float] = (0.0, 0.0, 0.4)
 
     friction_random_range: Tuple[float, float] = (0.5, 1.5)
     mass_random_range: Tuple[float, float] = (0.7, 1.3)
@@ -164,13 +162,18 @@ class RandomizationHyperparameters:
 @dataclass
 class PerceptionHyperparameters:
     workspace: Tuple[float, float, float, float, float, float] = (0.25, 1.75, -0.55, 0.95, 0.025, 2.0)
+    chained_workspace: Tuple[float, float, float, float, float, float] = (-0.35, 1.75, -0.55, 1.35, 0.025, 2.0)
     ground_z: float = 0.02
-    ground_points: int = 96  
+    ground_points: int = 96
     ground_xy_noise_std: float = 0.02
     camera_follow_drill: bool = False
     drill_crop_half: float = 0.2
-    img_height: int = 256
-    img_width: int = 256
+    wrist_cam_z_floor: float = 0.025
+    cam2_img_height: int = 192
+    cam2_img_width: int = 192
+    wrist_cam_far_clip: float = 0.5
+    img_height: int = 192
+    img_width: int = 192
 
 
 @dataclass
@@ -185,10 +188,10 @@ class AllHyperparameters:
     scene: SceneHyperparameters = None
     randomization: RandomizationHyperparameters = None
     perception: PerceptionHyperparameters = None
-    debug: bool = True  # 调试模式开关
+    debug: bool = True  # debug mode switch
 
     def __post_init__(self):
-        """初始化默认值"""
+        """Initialize defaults."""
         if self.reward is None:
             self.reward = RewardHyperparameters()
         if self.termination is None:
@@ -209,7 +212,7 @@ class AllHyperparameters:
             self.perception = PerceptionHyperparameters()
 
 
-# 默认超参数实例
+# default hyperparameter instance
 DEFAULT_HYPERPARAMETERS = AllHyperparameters()
 
 
@@ -217,7 +220,7 @@ DEFAULT_HYPERPARAMETERS = AllHyperparameters()
 def create_hyperparameters_from_config(config: dict) -> AllHyperparameters:
     hp = DEFAULT_HYPERPARAMETERS
 
-    # 从配置更新（如果存在）
+    # update from config (if present)
     if "scene" in config:
         scene_cfg = config["scene"]
         if "env_spacing" in scene_cfg:
@@ -295,21 +298,21 @@ def create_hyperparameters_from_config(config: dict) -> AllHyperparameters:
         if "episode_length_s" in sim_cfg:
             hp.simulation.episode_length_s = sim_cfg["episode_length_s"]
 
-        # 灵巧手摩擦
+        # hand friction
         if "hand_static_friction" in sim_cfg:
             hp.simulation.hand_static_friction = sim_cfg["hand_static_friction"]
         if "hand_dynamic_friction" in sim_cfg:
             hp.simulation.hand_dynamic_friction = sim_cfg["hand_dynamic_friction"]
         if "hand_restitution" in sim_cfg:
             hp.simulation.hand_restitution = sim_cfg["hand_restitution"]
-        # 电钻摩擦
+        # drill friction
         if "drill_static_friction" in sim_cfg:
             hp.simulation.drill_static_friction = sim_cfg["drill_static_friction"]
         if "drill_dynamic_friction" in sim_cfg:
             hp.simulation.drill_dynamic_friction = sim_cfg["drill_dynamic_friction"]
         if "drill_restitution" in sim_cfg:
             hp.simulation.drill_restitution = sim_cfg["drill_restitution"]
-        # 桌子摩擦
+        # table friction
         if "table_static_friction" in sim_cfg:
             hp.simulation.table_static_friction = sim_cfg["table_static_friction"]
         if "table_dynamic_friction" in sim_cfg:

@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 import time
-import math
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # repo root (scripts/ -> ../..)
 sys.path.insert(0, project_root)
@@ -10,7 +9,6 @@ sys.path.insert(0, project_root)
 import numpy as np
 import torch
 
-# Neutralize torch.compile BEFORE rl_games is imported.
 def _safe_compile(model=None, *args, **kwargs):
     if callable(model):
         return model
@@ -19,245 +17,1064 @@ torch.compile = _safe_compile
 
 DP3_ROOT = "/home/zeyu/3D-Diffusion-Policy/3D-Diffusion-Policy"
 sys.path.insert(0, DP3_ROOT)
-from perception.dp3_pointcloud import (depth_to_pointcloud_batch, build_fused_camera_pc,
-                           camera_pc, camera_crop_bounds, init_fps_kernel)
+from perception.dp3_pointcloud import (camera_pc, camera_crop_bounds, build_plate_cam_pc,
+                                        init_fps_kernel, wrist_cam_pose_w, raise_z_floor)
+from perception.groundtruth_mask import DEFAULT_MASK_THRESHOLD as _GT_MASK_THRESHOLD
+from perception.camera_setup import (load_perception_hp as _load_perception_hp,
+                                     ensure_rgb_aov, get_cameras, detect_wrist_cam,
+                                     apply_render_settings, setup_ground)
 init_fps_kernel("/home/zeyu/3D-Diffusion-Policy/third_party/pytorch3d_simplified")
-
-
-_PERCEPTION_HP = None
-def _load_perception_hp():
-    """按文件路径加载 hyperparameters.py 取 PerceptionHyperparameters,绕过 tasks 包
-    __init__(它 import grasp_drill_env 需要 IsaacLab)。与 collect 同一真源。"""
-    global _PERCEPTION_HP
-    if _PERCEPTION_HP is None:
-        import importlib.util
-        _p = os.path.join(project_root, "tasks", "config", "hyperparameters.py")
-        _spec = importlib.util.spec_from_file_location("_hp_standalone", _p)
-        _m = importlib.util.module_from_spec(_spec)
-        _spec.loader.exec_module(_m)
-        _PERCEPTION_HP = _m.DEFAULT_HYPERPARAMETERS.perception
-    return _PERCEPTION_HP
 
 
 def parse_args():
     _PERC = _load_perception_hp() 
-    parser = argparse.ArgumentParser(description="DP3 仿真部署与性能验证")
-    parser.add_argument("--dp3_ckpt", type=str,
-                        default="/home/zeyu/3D-Diffusion-Policy/3D-Diffusion-Policy/data/outputs/inspire_drill-simple_dp3-simple_dp3_seed0/checkpoints/latest.ckpt",
-                        help="DP3 checkpoint (.ckpt)")
-    parser.add_argument("--data_path", type=str, default=None,
-                        help="可选兜底:仅当 checkpoint 未内嵌 normalizer 时,用此 zarr 重算 "
-                             "normalizer(须与该 checkpoint 的训练数据一致)。"
-                             "正常 ckpt 自带 normalizer,无需提供本参数。")
-    parser.add_argument("--num_envs", type=int, default=32)
-    parser.add_argument("--num_episodes", type=int, default=1000,
-                        help="评估的总 episode 数（达到即停止）")
-    parser.add_argument("--num_inference_steps", type=int, default=None,
-                        help="DDIM inference steps（默认从 checkpoint 读取）")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dp3_ckpt', type=str, default='/home/zeyu/3D-Diffusion-Policy/3D-Diffusion-Policy/data/outputs/inspire_drill-simple_dp3-simple_dp3_seed0/checkpoints/latest.ckpt')
+    parser.add_argument("--num_envs", type=int, default=9)
+    parser.add_argument('--num_episodes', type=int, default=100)
+    parser.add_argument('--num_inference_steps', type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--drill_configs", type=str, default=None)
-    parser.add_argument("--img_height", type=int, default=_PERC.img_height,
-                        help="相机分辨率,默认来自 PerceptionHyperparameters(单一真源,与 collect 一致)")
+    parser.add_argument('--drill_variants', type=str, default=None)
+    parser.add_argument('--img_height', type=int, default=_PERC.img_height)
     parser.add_argument("--img_width", type=int, default=_PERC.img_width)
-    parser.add_argument("--pc_num_points", type=int, default=1024,
-                        help="相机段点数=两相机合计(cam1/cam2 各 512;须与 collect 一致,默认 1024)")
-    parser.add_argument("--robot_pc_points", type=int, default=160,
-                        help="机器人 FK 点云降采样点数(须与 collect 一致;None/负数=不降)")
-    parser.add_argument("--policy_pc_points", type=int, default=2048,
-                        help="DP3 policy 期望的每帧点云数量（必须与训练数据一致）")
-    parser.add_argument("--workspace", nargs=6, type=float,
-                        default=list(_PERC.workspace),
-                        help="[x_min..z_max] env-local (m);默认来自 hyperparameters.PerceptionHyperparameters.workspace(单一真源)")
-    parser.add_argument("--save_traj", type=str, default=None,
-                        help="保存每条轨迹的 state/action/reward 到 npz 文件")
-    parser.add_argument("--pc_mode", type=str, default="robot",
-                        choices=["camera", "robot", "robot_drill"],
-                        help="点云组成(须与训练数据一致):camera / robot / robot_drill")
-    parser.add_argument("--robot_pc_npz", type=str,
-                        default="assets/inspire_tac/robot_canonical_points.npz",
-                        help="FK 机器人 canonical 点(与 collect 用同一个文件)")
-    parser.add_argument("--drill_pc_points", type=int, default=512,
-                        help="电钻完整云点数(须与 collect --drill_pc_points 一致)")
-    parser.add_argument("--init_pose_file", type=str, default=None,
-                        help="overfit 测试用:加载 collect --save_init_poses 产出的 init_poses.npz,"
-                             "每次 reset 按 variant 回放记录的电钻初始位姿,验证 DP3 能否在相同场景复刻。")
-    parser.add_argument("--exec_horizon", type=int, default=None,
-                        help="缓解开环累积误差;须 1<=exec_horizon<=n_action_steps。")
-    parser.add_argument("--collect", action="store_true",
-                        help="开启采集模式:DP3 开车跑 rollout,把轨迹录成 zarr(schema 同 collect_dp3_data.py),"
-                             "用于 DAgger/recovery 数据。")
-    parser.add_argument("--collect_output", type=str,
-                        default="data/inspire_drill_dp3_deploy_collect.zarr",
-                        help="采集模式输出 zarr 路径。")
-    parser.add_argument("--collect_episodes", type=int, default=100,
-                        help="采集模式:录满多少个 episode 即停止(默认 100)。")
-    parser.add_argument("--collect_filter", type=str, default="all",
-                        choices=["all", "success", "failure"],
-                        help="采集过滤:all=成败都录 | success=只录成功(同 collect_dp3_data.py) | "
-                             "failure=只录失败(专门抓 DP3 失败模式/recovery 场景)。")
-    parser.add_argument("--collect_label_smooth_k", type=int, default=1,
-                        help="采集模式动作标签前向滑动平均窗口,1=关闭(默认,与 collect 一致)。"
-                             "注:当前 DeployCollector 未使用该参数,deploy 采集本就不平滑。")
-    parser.add_argument("--collect_success_only", action="store_true",
-                        help="[旧参数兼容] 等价于 --collect_filter success。")
+    parser.add_argument('--pc_num_points', type=int, default=1024)
+    parser.add_argument('--disable_cam2', action='store_true',
+                        help="cam1 alone supplies the whole camera segment (all pc_num_points); "
+                             "cam2 (wrist cam) is not sampled into the point cloud. Must match "
+                             "how the checkpoint's training data was collected "
+                             "(collect_dp3_data.py --disable_cam2).")
+    parser.add_argument('--robot_pc_points', type=int, default=160)
+    parser.add_argument('--ground_points', type=int, default=0)
+    parser.add_argument('--workspace', nargs=6, type=float, default=None)
+    parser.add_argument('--pc_mode', type=str, default='robot', choices=['camera', 'robot', 'robot_drill'])
+    parser.add_argument('--robot_pc_npz', type=str, default='assets/inspire_tac/robot_canonical_points.npz')
+    parser.add_argument('--mask_threshold', type=float, default=_GT_MASK_THRESHOLD,
+                        help="is_handle radius (m) for the 4th point-cloud channel. Single source of "
+                             "truth is perception/groundtruth_mask.DEFAULT_MASK_THRESHOLD, shared "
+                             "with collect_dp3_data.py; a different radius here is a different label "
+                             "definition, i.e. an out-of-distribution 4th channel at deploy time.")
+    parser.add_argument('--chained', action='store_true')
+    parser.add_argument('--stage1_only', action='store_true')
+    parser.add_argument('--stage2_only', action='store_true',
+                        help="deploy DP3 on the alignment-only task: drill starts already grasped "
+                             "(teleported in via --success_dataset, same pkl collect_dp3_data.py "
+                             "--stage2_only / play_stage2.py use). Point cloud = cam2(wrist)+cam3(plate), "
+                             "no separate oracle plate-crop segment. Uses Stage2Env directly (not "
+                             "ChainedEnv). Must match the checkpoint's training data "
+                             "(collect_dp3_data.py --stage2_only). Not compatible with --dual/--policy rl.")
+    parser.add_argument('--success_dataset', type=str, default='collected_data/success_data_dp3.pkl',
+                        help="pkl of successful stage1 grasp end-states (drill pose + joint pos), used "
+                             "by --stage2_only to reset directly into an already-grasped configuration")
+    parser.add_argument('--plate_pc_points', type=int, default=512)
+    parser.add_argument('--drill_mesh_points', type=int, default=512)
+    parser.add_argument('--success_hold_stop', type=int, default=1)
+    parser.add_argument('--episode_length_s', type=float, default=10.0)
+    parser.add_argument('--init_pose_file', type=str, default=None,)
+    parser.add_argument('--exam_n', type=int, default=200)   # sequential-exam poses per variant (only used with --init_pose_file)
+    parser.add_argument('--fixed_plate', action='store_true')
+    parser.add_argument('--exec_horizon', type=int, default=None)
+    parser.add_argument('--lag_comp', type=int, default=0)
+    parser.add_argument('--timeout_only', type=lambda s: str(s).lower() in ('1', 'true', 't', 'yes'), nargs='?', const=False, default=False)
+    parser.add_argument('--policy', type=str, default='dp3', choices=['dp3', 'rl'])
+    parser.add_argument('--stage1_checkpoint', type=str, default='runs/inspire_hand_grasp_drill_26-06-13-21-10/inspire_hand_grasp_drill_26-06-13-21-10/nn/inspire_hand_grasp_drill_26-06-13-21-10.pth')
+    parser.add_argument('--stage2_checkpoint', type=str, default='runs/stage2_26-07-11-18-36/stage2_26-07-11-18-36/nn/stage2_26-07-11-18-36.pth')
+    parser.add_argument('--rl_checkpoint', type=str, default=None)
+    parser.add_argument('--dual', action='store_true')
+    parser.add_argument('--driver', type=str, default='rl', choices=['rl', 'dp3'])
+    parser.add_argument('--dual_trace', type=str, default=None)
+    parser.add_argument('--stage2_dp3_ckpt', type=str, default=None,
+                        help="two-stage DP3 state machine: --dp3_ckpt drives GRASP, and once "
+                             "ChainedEnv flips an env's phase 0->1 (20-in-last-50 lenient success "
+                             "window, same criterion as --collect_success_data), THIS checkpoint "
+                             "takes over driving ALIGN. "
+                             "Both states' camera compositions + workspaces are hardcoded inside "
+                             "run_dp3_two_stage to match exactly how the two real checkpoints were "
+                             "collected. Requires --chained (auto-enabled), not --stage1_only/"
+                             "--stage2_only/--dual/--policy rl.")
+    parser.add_argument('--stage2_rl', action='store_true',
+                        help="hybrid state machine: --dp3_ckpt (DP3, point cloud) drives GRASP, and "
+                             "once ChainedEnv flips phase 0->1 the PRIVILEGED RL stage2 teacher "
+                             "(--stage2_checkpoint, 78-dim state obs) takes over ALIGN. Same env, "
+                             "same GRASP composition and same phase-switch criterion as "
+                             "--stage2_dp3_ckpt, so the two runs differ only in who drives ALIGN: "
+                             "the gap between them is the ALIGN distillation gap, and this run's "
+                             "end-to-end rate is an upper bound on what the Grasp Student's "
+                             "hand-off supports. Requires --chained (auto-enabled); mutually "
+                             "exclusive with --stage2_dp3_ckpt/--stage1_only/--stage2_only/--dual/"
+                             "--policy rl/--collect_success_data.")
+    parser.add_argument('--collect_success_data', action='store_true',
+                        help="")
+    parser.add_argument('--num_samples', type=int, default=1000,
+                        help="target number of success samples for --collect_success_data "
+                             "(ignored when --samples_per_variant is set)")
+    parser.add_argument('--samples_per_variant', type=int, default=None,
+                        help="--collect_success_data: exact per-variant quota (e.g. 500 -> "
+                             "500 x num_active_variants total); once a variant hits its quota its "
+                             "further successes are not collected (episodes keep running/resetting "
+                             "normally, mirrors collect_dp3_data.py's --episodes_per_variant). "
+                             "Overrides --num_samples.")
+    parser.add_argument('--output', type=str, default='collected_data/success_data.pkl',
+                        help="pkl output path for --collect_success_data")
+    # ---- removable block: --rate_limit (see perception/target_drive.install_direct_drive) ----
+    parser.add_argument('--rate_limit',
+                        type=lambda s: str(s).lower() in ('1', 'true', 't', 'yes'),
+                        nargs='?', const=True, default=True,
+                        help="clamp the commanded joint target to the same per-substep slew limit "
+                             "raw_to_target applies when generating training labels (arm "
+                             "+/-max_joint_delta, fingers +/-max_finger_delta). Training labels "
+                             "never exceed it (0.00%% of steps) but raw DP3 output does (measured "
+                             "15-26%% of arm steps, up to 16x), because DP3's q* never passes "
+                             "through raw_to_target. Default on; pass '--rate_limit false' to "
+                             "restore the old unclamped behaviour for an A/B.")
+    parser.add_argument('--dump_obs_zarr', type=str, default=None,
+                        help="debug: write the observations the DEPLOYED policy actually sees into a "
+                             "zarr with collect_dp3_data.py's exact layout (data/point_cloud, "
+                             "data/state, data/action, data/pc_mask when 4-channel, meta/episode_ends) "
+                             "-- same timing convention (row = obs at decision time + the q* executed "
+                             "that step) and the same bad-frame skipping, so it can be diffed 1:1 "
+                             "against the training zarr. Only --dump_obs_env's first "
+                             "--dump_obs_episodes episode(s). Main single-policy path only.")
+    parser.add_argument('--dump_obs_env', type=int, default=0,
+                        help="--dump_obs_zarr: which env to record (default 0)")
+    parser.add_argument('--dump_obs_episodes', type=int, default=1,
+                        help="--dump_obs_zarr: how many episodes of that env to record (default 1)")
     args = parser.parse_args()
-    if args.collect_success_only:
-        args.collect_filter = "success"
     args.save_robot_pc = args.pc_mode in ("robot", "robot_drill")
-    args.save_drill_pc = args.pc_mode == "robot_drill"
+    args.save_drill_mesh_pc = args.pc_mode == "robot_drill"
+    if args.workspace is None:
+        args.workspace = list(_PERC.chained_workspace
+                              if (args.chained or args.stage2_only or args.stage2_dp3_ckpt is not None)
+                              else _PERC.workspace)
     return args
 
 
 
-def compute_normalizer_from_zarr(data_path: str, device: str):
+def _build_teachers(env_unwrapped, args):
+    """Build the RL teacher player (chained=two / non-chained=one); give obs/act space explicitly, no self-built env.
+    Return (mode, agent1, agent2, d1, d2); in single mode agent2/d2 are None. Same as collect."""
+    import yaml
+    import importlib.util as _ilu
 
+    def _resolve(p):
+        return p if (p is None or os.path.isabs(p)) else os.path.join(project_root, p)
+
+    _pc_spec = _ilu.spec_from_file_location(
+        "_play_chained", os.path.join(project_root, "scripts", "play_chained.py"))
+    _pc = _ilu.module_from_spec(_pc_spec)
+    _pc_spec.loader.exec_module(_pc)
+
+    with open(os.path.join(project_root, "config/agents/rl_games_ppo_cfg.yaml")) as f:
+        agent_cfg = yaml.safe_load(f)
+    agent_cfg["params"]["config"]["num_actors"] = args.num_envs
+    agent_cfg["params"]["config"]["device"] = args.device
+    agent_cfg["params"]["config"]["device_name"] = args.device
+    act_dim = int(env_unwrapped.cfg.action_space)
+
+    if args.chained:
+        s1, s2 = _resolve(args.stage1_checkpoint), _resolve(args.stage2_checkpoint)
+        for _p in (s1, s2):
+            if not os.path.exists(_p):
+                raise FileNotFoundError(f"RL teacher checkpoint not found: {_p}")
+        d1 = _pc._ckpt_obs_dim(s1)
+        d2 = _pc._ckpt_obs_dim(s2)
+        agent1 = _pc._build_player(agent_cfg, s1, d1, act_dim, args.num_envs, args.device)
+        agent2 = _pc._build_player(agent_cfg, s2, d2, act_dim, args.num_envs, args.device)
+        print(f"[RL-TEACHER] chained dual teacher: stage1 obs={d1}, stage2 obs={d2}", flush=True)
+        return "chained", agent1, agent2, d1, d2
+    rlck = _resolve(args.rl_checkpoint or args.stage1_checkpoint)
+    if not os.path.exists(rlck):
+        raise FileNotFoundError(f"RL teacher checkpoint not found: {rlck}")
+    d1 = _pc._ckpt_obs_dim(rlck)
+    agent = _pc._build_player(agent_cfg, rlck, d1, act_dim, args.num_envs, args.device)
+    print(f"[RL-TEACHER] single teacher: obs={d1}", flush=True)
+    return "single", agent, None, d1, None
+
+
+def _teacher_raw_action(mode, agent1, agent2, d1, obs_priv, env_unwrapped, device):
+    """Pick teacher raw action ([-1,1]) by phase, same as collect/play_chained."""
+    if mode == "chained":
+        a1 = agent1.get_action(agent1.obs_to_torch(obs_priv[:, :d1]), is_deterministic=True)
+        a2 = agent2.get_action(agent2.obs_to_torch(obs_priv), is_deterministic=True)
+        traw = torch.where((env_unwrapped.phase == 1).unsqueeze(1), a2, a1)
+    else:
+        traw = agent1.get_action(agent1.obs_to_torch(obs_priv), is_deterministic=True)
+    if not isinstance(traw, torch.Tensor):
+        traw = torch.from_numpy(np.array(traw)).float().to(device)
+    return traw
+
+
+def _build_stage2_rl_player(env_unwrapped, args):
+    """Build ONLY the stage2 RL teacher player (--stage2_checkpoint), for --stage2_rl's ALIGN state.
+
+    _build_teachers() cannot be reused here: with args.chained it insists on both stage1 and stage2
+    checkpoints, and --stage2_rl has no use for the stage1 teacher (DP3 drives GRASP).
+    Returns (player, ckpt_obs_dim)."""
+    import yaml
+    import importlib.util as _ilu
+
+    _pc_spec = _ilu.spec_from_file_location(
+        "_play_chained", os.path.join(project_root, "scripts", "play_chained.py"))
+    _pc = _ilu.module_from_spec(_pc_spec)
+    _pc_spec.loader.exec_module(_pc)
+
+    ckpt = args.stage2_checkpoint
+    if not os.path.isabs(ckpt):
+        ckpt = os.path.join(project_root, ckpt)
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError(f"--stage2_rl needs --stage2_checkpoint, not found: {ckpt}")
+
+    with open(os.path.join(project_root, "config/agents/rl_games_ppo_cfg.yaml")) as f:
+        agent_cfg = yaml.safe_load(f)
+    agent_cfg["params"]["config"]["num_actors"] = args.num_envs
+    agent_cfg["params"]["config"]["device"] = args.device
+    agent_cfg["params"]["config"]["device_name"] = args.device
+
+    obs_dim = _pc._ckpt_obs_dim(ckpt)
+    player = _pc._build_player(agent_cfg, ckpt, obs_dim, int(env_unwrapped.cfg.action_space),
+                               args.num_envs, args.device)
+    return player, obs_dim
+
+
+def run_rl_teacher_eval(env_unwrapped, simulation_app, args):
+    """Drive with the RL teacher (privileged obs) inside the exact same eval env as DP3 deploy.
+    Only the policy changes: env / init_pose replay / success counting / episode management are byte-for-byte identical to the DP3 branch,
+    so the difference in success rate between the two runs = pure teacher-student gap (same eval criterion)."""
+    from perception.target_drive import install_direct_drive, raw_to_target
+
+    mode, agent1, agent2, d1, d2 = _build_teachers(env_unwrapped, args)
+    _drive_p = install_direct_drive(env_unwrapped)   # teacher raw -> q*, same source as collect
+
+    if args.timeout_only:
+        _orig_get_dones = env_unwrapped._get_dones
+
+        def _get_dones_timeout_only():
+            # still call the original _get_dones to update the success cache (_cached_lenient_success etc.). In the termination condition
+            # keep only NaN (physically diverged envs must be recycled, else bad poses spam USD warnings each frame and pollute stats),
+            # all other conditions (success/drop/joint-limit) do not terminate, letting the episode run to timeout (truncated).
+            terminated, truncated = _orig_get_dones()
+            nan_mask = getattr(env_unwrapped, "_pending_nan_mask", None)
+            term = (nan_mask.clone() if nan_mask is not None else torch.zeros_like(terminated))
+            return term, truncated
+
+        env_unwrapped._get_dones = _get_dones_timeout_only
+
+    obs = env_unwrapped._get_observations()["policy"]
+    if mode == "chained":
+        agent1.get_batch_size(obs[:, :d1], 1); agent1.reset()
+        agent2.get_batch_size(obs, 1); agent2.reset()
+    else:
+        agent1.get_batch_size(obs, 1); agent1.reset()
+
+    # ---- success counting: same criterion as the DP3 branch ----
+    env_episode_rewards = torch.zeros(args.num_envs, device=args.device)
+    total_episodes = successful_episodes = grasp_successful_episodes = stable_grasp_episodes = 0
+    ever_grasp = np.zeros(args.num_envs, dtype=bool)
+    grasp_switch_steps = []
+    success_log = []
+    episode_rewards = []
+    total_steps = 0
+    start_time = time.time()
+    print(f"\n[RL-TEACHER] rollout (target {args.num_episodes} episodes, {args.num_envs} envs); "
+          f"eval: episode={args.episode_length_s}s success_hold_stop={args.success_hold_stop} "
+          f"init_pose_file={'yes' if args.init_pose_file else 'no'}", flush=True)
+    sys.stdout.flush()
+
+    with torch.inference_mode():
+        while simulation_app.is_running() and total_episodes < args.num_episodes:
+            teacher_raw = _teacher_raw_action(mode, agent1, agent2, d1, obs,
+                                              env_unwrapped, args.device)
+            cur0 = env_unwrapped.cur_targets.clone()
+            env_unwrapped._direct_target = raw_to_target(teacher_raw, cur0, _drive_p)
+            obs_dict, rewards, terminated, truncated, _ = env_unwrapped.step(teacher_raw)
+            obs = obs_dict["policy"]
+            total_steps += 1
+
+            env_episode_rewards += rewards
+            is_done = terminated.bool() | truncated.bool()
+            try:
+                lenient_success = env_unwrapped._cached_lenient_success
+            except AttributeError:
+                lenient_success = torch.zeros(args.num_envs, dtype=torch.bool, device=args.device)
+            if args.chained:
+                _inst = getattr(env_unwrapped, "_cached_instant_success", None)
+                if _inst is not None:
+                    ever_grasp |= _inst.detach().cpu().numpy().astype(bool)
+
+            finished = torch.where(is_done)[0]
+            for env_idx in finished:
+                env_id = env_idx.item()
+                total_episodes += 1
+                episode_rewards.append(env_episode_rewards[env_id].item())
+                if lenient_success[env_id]:
+                    successful_episodes += 1; success_log.append(1)
+                else:
+                    success_log.append(0)
+                if args.chained:
+                    if ever_grasp[env_id]:
+                        grasp_successful_episodes += 1
+                    ever_grasp[env_id] = False
+                    _sw = int(env_unwrapped._last_episode_switch_step[env_id].item())
+                    if _sw >= 0:
+                        stable_grasp_episodes += 1; grasp_switch_steps.append(_sw)
+                env_episode_rewards[env_id] = 0.0
+            if is_done.any():
+                agent1.reset()
+                if mode == "chained":
+                    agent2.reset()
+
+            if total_steps % 100 == 0:
+                elapsed = time.time() - start_time
+                sr = successful_episodes / max(total_episodes, 1) * 100
+                _grasp = (f"| grasp={grasp_successful_episodes} "
+                          f"({grasp_successful_episodes / max(total_episodes, 1) * 100:.1f}%) "
+                          f"stable={stable_grasp_episodes} " if args.chained else "")
+                print(f"  step={total_steps} | eps={total_episodes}/{args.num_episodes} "
+                      f"| succ={successful_episodes} ({sr:.1f}%) {_grasp}"
+                      f"| {total_steps/elapsed:.1f} step/s", flush=True)
+                sys.stdout.flush()
+
+    print(f"\n{'='*60}")
+    print("[RL-TEACHER] === teacher (privileged obs) results in the DP3 eval env ===")
+    if total_episodes > 0:
+        print(f"Success rate: {successful_episodes/total_episodes*100:.1f}%")
+        if args.chained:
+            print(f"Grasp success (>=1 step): {grasp_successful_episodes} "
+                  f"({grasp_successful_episodes/total_episodes*100:.1f}%)")
+            print(f"Grasp stable (entered stage2): {stable_grasp_episodes} "
+                  f"({stable_grasp_episodes/total_episodes*100:.1f}%)")
+            if stable_grasp_episodes > 0:
+                print(f"Align | stable: {successful_episodes/stable_grasp_episodes*100:.1f}%")
+    if episode_rewards:
+        ep = np.array(episode_rewards)
+        print(f"Reward: mean={ep.mean():.1f} max={ep.max():.1f} min={ep.min():.1f}")
+    if success_log:
+        print(f"Success log: {success_log}")
+    print(f"{'='*60}")
+
+
+def _load_dp3_ckpt_for_two_stage(ckpt_path, expected_pc, device, num_inference_steps_override, tag):
+    """Minimal, self-contained DP3 checkpoint loader for run_dp3_two_stage (separate from the main
+    single-checkpoint loading code below to avoid touching that already-working path)."""
+    from diffusion_policy_3d.policy.dp3 import DP3
     import dill
-    _cache_path = data_path.rstrip("/") + ".normalizer.pkl"
-    _zarray = os.path.join(data_path, "data", "point_cloud", ".zarray")
-    _src_mtime = os.path.getmtime(_zarray) if os.path.exists(_zarray) else None
-    if os.path.exists(_cache_path):
-        try:
-            with open(_cache_path, "rb") as _f:
-                _blob = dill.load(_f)
-            if _blob.get("src_mtime") == _src_mtime:
-                print(f"[Normalizer] Loaded from cache (skipped zarr scan): {_cache_path}")
-                return _blob["normalizer"]
-            if _src_mtime is None:
-                # 源 zarr 缺失/不完整(常见:磁盘清理删了点云数组),但缓存的 normalizer 仍有效。
-                # 无法重算,直接用缓存——这正是该数据集当初算出的 normalizer。
-                print(f"[Normalizer] source zarr missing/incomplete; using cached normalizer: {_cache_path}", flush=True)
-                return _blob["normalizer"]
-            print("[Normalizer] cache stale (zarr changed), recomputing", flush=True)
-        except Exception as _e:
-            print(f"[Normalizer] cache load failed ({_e}), recomputing", flush=True)
+    from hydra.utils import instantiate as hydra_instantiate
+    from omegaconf import OmegaConf
+    OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-    import zarr
-    from diffusion_policy_3d.model.common.normalizer import (
-        LinearNormalizer, SingleFieldLinearNormalizer)
+    payload = torch.load(ckpt_path, pickle_module=dill, map_location="cpu")
+    cfg = payload["cfg"]
 
-    z = zarr.open_group(data_path)
-    state_data = z['data']['state'][:]           
-    action_data = z['data']['action'][:]         
-    pc = z['data']['point_cloud']              
+    def _get(path_fns, default=None):
+        for fn in path_fns:
+            try:
+                return fn()
+            except Exception:
+                continue
+        return default
 
-    normalizer = LinearNormalizer()
-    normalizer['action'] = SingleFieldLinearNormalizer.create_fit(
-        action_data, last_n_dims=1, mode='limits')
-    normalizer['agent_pos'] = SingleFieldLinearNormalizer.create_fit(
-        state_data, last_n_dims=1, mode='limits')
+    agent_dim = _get([lambda: int(cfg.task.shape_meta.obs.agent_pos.shape[0]),
+                      lambda: int(cfg.shape_meta.obs.agent_pos.shape[0])], 13)
+    with_force = agent_dim > 13
+    ckpt_pc = _get([lambda: int(cfg.task.shape_meta.obs.point_cloud.shape[0]),
+                    lambda: int(cfg.shape_meta.obs.point_cloud.shape[0])], None)
+    if ckpt_pc is not None and ckpt_pc != expected_pc:
+        raise RuntimeError(
+            f"[{tag}] {ckpt_path}: point_cloud={ckpt_pc} != expected {expected_pc} "
+            f"(run_dp3_two_stage's hardcoded camera composition for this state)")
 
-    # point_cloud 分块流式:逐 xyz 维 min/max/mean/std
-    T = int(pc.shape[0]); D = int(pc.shape[-1]); block = 4096
-    run_min = run_max = None
-    s = torch.zeros(D, dtype=torch.float64)
-    ss = torch.zeros(D, dtype=torch.float64)
-    n = 0
-    for start in range(0, T, block):
-        t = torch.from_numpy(np.asarray(pc[start:start + block], dtype=np.float32)).reshape(-1, D)
-        bmin = t.min(dim=0).values; bmax = t.max(dim=0).values
-        run_min = bmin if run_min is None else torch.minimum(run_min, bmin)
-        run_max = bmax if run_max is None else torch.maximum(run_max, bmax)
-        td = t.double(); s += td.sum(dim=0); ss += (td * td).sum(dim=0); n += t.shape[0]
-    mean = (s / max(n, 1)).float()
-    std = ((ss / max(n, 1)).float() - mean * mean).clamp_min(0).sqrt()
-    omin, omax, eps = -1.0, 1.0, 1e-4
-    rng = (run_max - run_min).clone(); ignore = rng < eps; rng[ignore] = omax - omin
-    scale = (omax - omin) / rng
-    offset = omin - scale * run_min
-    offset[ignore] = (omax + omin) / 2 - run_min[ignore]
-    normalizer['point_cloud'] = SingleFieldLinearNormalizer.create_manual(
-        scale, offset, {'min': run_min, 'max': run_max, 'mean': mean, 'std': std})
+    policy: DP3 = hydra_instantiate(cfg.policy)
+    policy.to(device); policy.eval()
+    policy.load_state_dict(payload["state_dicts"]["model"], strict=False)
+    if num_inference_steps_override is not None:
+        policy.num_inference_steps = num_inference_steps_override
 
-    print(f"  action  range: {action_data.min():.3f} ~ {action_data.max():.3f}")
-    print(f"  agent_pos range: {state_data.min():.3f} ~ {state_data.max():.3f}")
-    print(f"  point_cloud range: {run_min.min():.3f} ~ {run_max.max():.3f}")
+    has_ema = "ema_model" in payload["state_dicts"]
+    if has_ema:
+        policy_ema: DP3 = hydra_instantiate(cfg.policy)
+        policy_ema.to(device)
+        policy_ema.load_state_dict(payload["state_dicts"]["ema_model"], strict=False)
+        if num_inference_steps_override is not None:
+            policy_ema.num_inference_steps = num_inference_steps_override
+        policy_ema.eval()
+    else:
+        policy_ema = policy
 
-    try:
-        with open(_cache_path, "wb") as _f:
-            dill.dump({"src_mtime": _src_mtime, "normalizer": normalizer}, _f)
-        print(f"[Normalizer] Cached for next run: {_cache_path}")
-    except Exception as _e:
-        print(f"[Normalizer] cache save failed (non-fatal): {_e}", flush=True)
-    return normalizer
+    def _norm_ready(p):
+        return len(p.normalizer.params_dict) > 0
+
+    if _norm_ready(policy):
+        policy.normalizer.to(device)
+        if has_ema:
+            if not _norm_ready(policy_ema):
+                policy_ema.set_normalizer(policy.normalizer)
+            policy_ema.normalizer.to(device)
+    elif "pickles" in payload and "normalizer" in payload["pickles"]:
+        normalizer = dill.loads(payload["pickles"]["normalizer"])
+        policy.set_normalizer(normalizer); policy.normalizer.to(device)
+        if has_ema:
+            policy_ema.set_normalizer(normalizer); policy_ema.normalizer.to(device)
+    else:
+        raise RuntimeError(f"[{tag}] {ckpt_path}: no embedded normalizer, cannot deploy")
+
+    print(f"  [{tag}] point_cloud={ckpt_pc} agent_pos={agent_dim} (force_state={with_force}) "
+          f"n_obs={policy.n_obs_steps} n_act={policy.n_action_steps} horizon={policy.horizon}", flush=True)
+    return dict(policy_ema=policy_ema, with_force=with_force, agent_dim=agent_dim,
+               n_obs=policy.n_obs_steps, n_act=policy.n_action_steps, horizon=policy.horizon)
 
 
-class DeployCollector:
+def run_collect_success_data(env_unwrapped, simulation_app, args, cam1, PERC):
+    """Run the GRASP/stage1 DP3 checkpoint (--dp3_ckpt) and record the final drill pose + robot
+    joint pose of every successful grasp into a pkl -- the SAME format scripts/collect_success_data.py
+    produces (consumed by SuccessDataDataset / Stage2Env / --stage2_only), just sourced from DP3
+    instead of the RL teacher, so stage2's starting-state distribution matches what a real DP3
+    stage1 hand-off actually produces.
 
-    _CHUNK_FRAMES = 16
+    Camera composition is hardcoded to match --stage1_only exactly: cam1 alone 2048 + robot 512 =
+    2560, PERC.workspace (the narrow box) -- see run_dp3_two_stage's docstring for why the workspace
+    choice matters (a standalone --stage1_only run has always resolved to the narrow box, and that's
+    what the checkpoint's training data was collected under).
 
-    def __init__(self, output, num_envs, total_pc, filter_mode, state_dim=13):
-        import shutil
-        import zarr
-        import numcodecs
-        self.total_pc = total_pc
-        self.state_dim = state_dim        
-        self.filter_mode = filter_mode    
-        self.output = output
-        os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-        # zarr v3(env_isaaclab)下 zarr.group() 不覆盖已存在的 store,create_group 会抛
-        # ContainsGroupError(常见:上一次 Ctrl-C 留下半截 zarr)。直接整体清掉再重建。
-        if os.path.exists(output):
-            print(f"[COLLECT] 输出已存在,覆盖: {output}", flush=True)
-            shutil.rmtree(output) if os.path.isdir(output) else os.remove(output)
-        comp = numcodecs.Blosc(cname="zstd", clevel=3, shuffle=1)
-        root = zarr.group(output, zarr_format=2)
-        self.data = root.create_group("data")
-        self.meta = root.create_group("meta")
-        cf = self._CHUNK_FRAMES
-        self.data.create_dataset("state", shape=(0, state_dim), dtype="float32",
-                                 compressor=comp, chunks=(cf, state_dim), overwrite=True)
-        self.data.create_dataset("action", shape=(0, 13), dtype="float32",
-                                 compressor=comp, chunks=(cf, 13), overwrite=True)
-        self.data.create_dataset("point_cloud", shape=(0, total_pc, 3), dtype="float32",
-                                 compressor=comp, chunks=(cf, total_pc, 3), overwrite=True)
-        self.meta.create_dataset("episode_ends", shape=(0,), dtype="int64",
-                                 compressor=comp, chunks=(100,), overwrite=True)
-        self.episode_ends = []
-        self.buffers = [[] for _ in range(num_envs)]
-        self.started = np.zeros(num_envs, dtype=bool)   # 与 collect 的 env_started 同义:跳过开局半截
-        self.collected = 0
+    Caching convention mirrors collect_success_data.py's history_len=0 case: every step, snapshot
+    (agent_pos, joint_pos, drill pos/quat) BEFORE stepping; whenever the step's resulting
+    `_cached_lenient_success` is True, overwrite that env's cache with the pre-step snapshot. The
+    cache is refreshed every success step, so by the time the episode actually ends the cache holds
+    the LAST state that was still in success -- the same "final grasp pose" semantics as the
+    original collector, just with DP3 driving instead of the RL teacher."""
+    from perception.target_drive import install_direct_drive
+    from perception.student_obs import build_agent_pos
+    from perception.robot_pointcloud import RobotPointCloudFK
+    from collections import deque, Counter
+    import pickle
 
-    def record_frame(self, env_id, state_np, action_np, pc_np):
-        self.buffers[env_id].append((state_np, action_np, pc_np))
+    CAM_PTS = 2048
+    ROBOT_PTS = 512
+    workspace = tuple(PERC.workspace)   # narrow box -- matches --stage1_only, see run_dp3_two_stage
 
-    def _keep(self, success):
-        if self.filter_mode == "success":
-            return success
-        if self.filter_mode == "failure":
-            return not success
-        return True   # all
+    install_direct_drive(env_unwrapped, rate_limit=args.rate_limit)
 
-    def flush(self, env_id, success):
-        """一个 episode 结束:满足过滤条件则写盘,然后清 buffer。"""
-        buf = self.buffers[env_id]
-        if buf and self._keep(success):
-            states, actions, pcs = zip(*buf)
-            states_arr = np.stack(states).astype(np.float32)
-            actions_arr = np.stack(actions).astype(np.float32)
-            pcs_arr = np.stack(pcs).astype(np.float32)
-            n = len(buf)
-            idx = self.data["state"].shape[0]
-            self.data["state"].resize((idx + n, self.state_dim))
-            self.data["action"].resize((idx + n, 13))
-            self.data["point_cloud"].resize((idx + n, self.total_pc, 3))
-            self.data["state"][idx:idx + n] = states_arr
-            self.data["action"][idx:idx + n] = actions_arr
-            self.data["point_cloud"][idx:idx + n] = pcs_arr
-            self.episode_ends.append(idx + n)
-            ends = np.array(self.episode_ends, dtype=np.int64)
-            self.meta["episode_ends"].resize((len(ends),))
-            self.meta["episode_ends"][:] = ends
-            self.collected += 1
-        self.buffers[env_id] = []
+    _npz = args.robot_pc_npz if os.path.isabs(args.robot_pc_npz) else os.path.join(project_root, args.robot_pc_npz)
+    robot_fk = RobotPointCloudFK(_npz, list(env_unwrapped.franka.body_names), args.device, max_points=ROBOT_PTS)
+    total_pc = CAM_PTS + robot_fk.num_points
+
+    print(f"[COLLECT] GRASP composition (hardcoded): cam1 alone {CAM_PTS} + robot {robot_fk.num_points} "
+          f"= {total_pc} pts, workspace={workspace} | ckpt={args.dp3_ckpt}", flush=True)
+    if args.pc_num_points != 1024 or args.disable_cam2 or args.robot_pc_points != 160:
+        print("[COLLECT] NOTE: --pc_num_points/--disable_cam2/--robot_pc_points are ignored in "
+              "--collect_success_data mode (camera config is hardcoded, see above)", flush=True)
+
+    ck = _load_dp3_ckpt_for_two_stage(args.dp3_ckpt, total_pc, args.device, args.num_inference_steps, "GRASP")
+    n_obs, n_act, horizon = ck["n_obs"], ck["n_act"], ck["horizon"]
+    if args.lag_comp < 0 or n_obs - 1 + args.lag_comp + n_act > horizon:
+        raise ValueError(f"lag_comp={args.lag_comp} invalid (need 0<=lag_comp and "
+                         f"(n_obs-1)+lag_comp+n_act<=horizon)")
+    exec_n = n_act if args.exec_horizon is None else max(1, min(args.exec_horizon, n_act))
+
+    env_origins = env_unwrapped.scene.env_origins
+    controlled = env_unwrapped.controlled_joint_indices
+    dt = env_unwrapped.step_dt
+
+    def build_obs():
+        ws = camera_crop_bounds(env_unwrapped.drill.data.root_pos_w, env_origins, PERC, workspace)
+        pc1, _, _ = camera_pc(cam1, ws, CAM_PTS, env_origins)
+        pcf = torch.cat([pc1, robot_fk(env_unwrapped.franka.data.body_pos_w,
+                                       env_unwrapped.franka.data.body_quat_w, env_origins)], dim=1)
+        agent_pos = build_agent_pos(env_unwrapped, ck["with_force"])
+        return pcf, agent_pos
+
+    env_obs_histories = [deque(maxlen=n_obs + n_act) for _ in range(args.num_envs)]
+    pending_actions = [None] * args.num_envs
+    pending_idx = [0] * args.num_envs
+
+    pc_all, agent_all = build_obs()
+    for e in range(args.num_envs):
+        for _ in range(n_obs):
+            env_obs_histories[e].append({"agent_pos": agent_all[e], "point_cloud": pc_all[e]})
+
+    # per-env success cache (overwritten every step current_success holds; read out at episode end)
+    cache_valid = torch.zeros(args.num_envs, dtype=torch.bool)
+    cache_agent = agent_all.detach().cpu().clone()
+    cache_jp = env_unwrapped.franka.data.joint_pos[:, controlled].detach().cpu().clone()
+    cache_dp = (env_unwrapped.drill.data.root_pos_w - env_origins).detach().cpu().clone()
+    cache_dq = env_unwrapped.drill.data.root_quat_w.detach().cpu().clone()
+    cache_vid = env_unwrapped._drill_variant_indices.detach().cpu().clone()
+
+    env_episode_rewards = torch.zeros(args.num_envs, device=args.device)
+    collected_samples = []
+    total_steps = 0
+    start_time = time.time()
+
+    active_vids = sorted(v.variant_index for v in env_unwrapped.drill_variants)
+    per_variant_target = args.samples_per_variant
+    per_variant_count = {vid: 0 for vid in active_vids}
+    target_total = (per_variant_target * len(active_vids)) if per_variant_target is not None else args.num_samples
+
+    def _collection_done():
+        if per_variant_target is not None:
+            return all(per_variant_count[v] >= per_variant_target for v in active_vids)
+        return len(collected_samples) >= args.num_samples
+
+    if per_variant_target is not None:
+        print(f"\n[COLLECT] rollout starting (target {per_variant_target} x {len(active_vids)} "
+              f"variants = {target_total} success samples, {args.num_envs} envs)", flush=True)
+    else:
+        print(f"\n[COLLECT] rollout starting (target {args.num_samples} success samples, "
+              f"{args.num_envs} envs)", flush=True)
+    sys.stdout.flush()
+
+    with torch.inference_mode():
+        while simulation_app.is_running() and not _collection_done():
+            need = [e for e in range(args.num_envs)
+                   if pending_actions[e] is None or pending_idx[e] >= exec_n]
+            if need:
+                obs_batch, pc_batch = [], []
+                for e in need:
+                    hist = list(env_obs_histories[e])[-n_obs:]
+                    if len(hist) < n_obs:
+                        hist = [hist[0]] * (n_obs - len(hist)) + hist
+                    obs_batch.append(torch.stack([h["agent_pos"] for h in hist]))
+                    pc_batch.append(torch.stack([h["point_cloud"] for h in hist]))
+                obs_dict = {"agent_pos": torch.stack(obs_batch), "point_cloud": torch.stack(pc_batch)}
+                result = ck["policy_ema"].predict_action(obs_dict)
+                cs = n_obs - 1 + args.lag_comp
+                chunks = result["action_pred"][:, cs:cs + n_act]
+                for i, e in enumerate(need):
+                    pending_actions[e] = chunks[i]
+                    pending_idx[e] = 0
+
+            actions = torch.zeros((args.num_envs, 13), device=args.device, dtype=torch.float32)
+            for e in range(args.num_envs):
+                actions[e] = pending_actions[e][pending_idx[e]]
+                pending_idx[e] += 1
+
+            # snapshot BEFORE stepping (this step's action is about to be applied to THIS state)
+            pre_agent = agent_all.detach().cpu().clone()
+            pre_jp = env_unwrapped.franka.data.joint_pos[:, controlled].detach().cpu().clone()
+            pre_dp = (env_unwrapped.drill.data.root_pos_w - env_origins).detach().cpu().clone()
+            pre_dq = env_unwrapped.drill.data.root_quat_w.detach().cpu().clone()
+            pre_vid = env_unwrapped._drill_variant_indices.detach().cpu().clone()
+
+            env_unwrapped._direct_target = actions
+            obs_dict_step, rewards, terminated, truncated, _ = env_unwrapped.step(actions)
+            total_steps += 1
+            env_episode_rewards += rewards
+
+            cam1.update(dt)
+
+            try:
+                lenient_success = env_unwrapped._cached_lenient_success
+            except AttributeError:
+                lenient_success = torch.zeros(args.num_envs, dtype=torch.bool, device=args.device)
+            is_done = terminated.bool() | truncated.bool()
+
+            success_now = lenient_success.detach().cpu()
+            if success_now.any():
+                cache_valid |= success_now
+                cache_agent[success_now] = pre_agent[success_now]
+                cache_jp[success_now] = pre_jp[success_now]
+                cache_dp[success_now] = pre_dp[success_now]
+                cache_dq[success_now] = pre_dq[success_now]
+                cache_vid[success_now] = pre_vid[success_now]
+
+            pc_all, agent_all = build_obs()
+
+            finished = torch.where(is_done)[0]
+            for env_idx in finished:
+                e = env_idx.item()
+                vid = int(cache_vid[e].item())
+                _quota_ok = (per_variant_count[vid] < per_variant_target
+                            if per_variant_target is not None else len(collected_samples) < args.num_samples)
+                if cache_valid[e] and _quota_ok:
+                    vname = env_unwrapped._variant_attrs.get(vid, {}).get("name", f"variant_{vid}")
+                    win_sum = (int(env_unwrapped._success_window[e].sum().item())
+                              if hasattr(env_unwrapped, "_success_window") else 0)
+                    collected_samples.append({
+                        # DP3's own agent_pos vector (13 or 26-dim), NOT rl_games' policy obs vector
+                        "full_obs": cache_agent[e].numpy(),
+                        "joint_pos": cache_jp[e].numpy(),
+                        "joint_vel": np.zeros_like(cache_jp[e].numpy()),   # not tracked by this collector
+                        "drill_pos": cache_dp[e].numpy(),
+                        "drill_quat": cache_dq[e].numpy(),
+                        "drill_lin_vel": np.zeros(3, dtype=np.float32),
+                        "drill_ang_vel": np.zeros(3, dtype=np.float32),
+                        "variant_idx": vid,
+                        "variant_name": vname,
+                        "episode_reward": float(env_episode_rewards[e].item()),
+                        "success_hold_steps": win_sum,
+                        "success_window_sum": win_sum,
+                    })
+                    per_variant_count[vid] += 1
+                cache_valid[e] = False
+                env_episode_rewards[e] = 0.0
+
+            for e in range(args.num_envs):
+                if not is_done[e]:
+                    env_obs_histories[e].append({"agent_pos": agent_all[e], "point_cloud": pc_all[e]})
+                else:
+                    pending_actions[e] = None
+                    pending_idx[e] = 0
+                    env_obs_histories[e].clear()
+                    for _ in range(n_obs):
+                        env_obs_histories[e].append({"agent_pos": agent_all[e], "point_cloud": pc_all[e]})
+
+            if total_steps % 100 == 0:
+                elapsed = time.time() - start_time
+                n = len(collected_samples)
+                eta = (elapsed / max(n, 1)) * (target_total - n)
+                em, es = divmod(int(eta), 60); eh, em = divmod(em, 60)
+                _pv = (" | " + " ".join(f"v{v}={per_variant_count[v]}/{per_variant_target}"
+                                       for v in active_vids)
+                      if per_variant_target is not None else "")
+                print(f"  step={total_steps} | collected={n}/{target_total}{_pv} "
+                      f"| {total_steps/elapsed:.1f} step/s | ETA={eh}h{em}m{es}s", flush=True)
+                sys.stdout.flush()
+
+    output_dir = os.path.dirname(args.output)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    metadata = {
+        "num_samples": len(collected_samples),
+        "obs_dim": collected_samples[0]["full_obs"].shape[-1] if collected_samples else 0,
+        "joint_pos_dim": collected_samples[0]["joint_pos"].shape[-1] if collected_samples else 0,
+        "joint_vel_dim": collected_samples[0]["joint_vel"].shape[-1] if collected_samples else 0,
+        "version": "dp3-1.0",
+        "history_len": 0,
+        "description": (
+            "Success episode data for grasp_drill task, collected by DP3 (--dp3_ckpt) via "
+            "deploy_dp3_sim.py --collect_success_data, NOT the RL teacher. full_obs is DP3's own "
+            "agent_pos vector (13 or 26-dim), not rl_games' policy obs vector. joint_vel/"
+            "drill_lin_vel/drill_ang_vel are not tracked by this collector (zero-filled) -- "
+            "Stage2Env._reset_idx never reads them anyway. Stores the LAST state at which "
+            "lenient_success still held (cache refreshed every success step). drill_pos is in "
+            "LOCAL coordinates (relative to env_origin). joint_pos is 13-dim controlled joints only."
+        ),
+    }
+    with open(args.output, "wb") as f:
+        pickle.dump({"metadata": metadata, "samples": collected_samples}, f)
+
+    elapsed = time.time() - start_time
+    m, s = divmod(int(elapsed), 60); h, m = divmod(m, 60)
+    print(f"\n{'='*60}")
+    print(f"[COLLECT] collection complete: {len(collected_samples)}/{target_total} samples")
+    print(f"  total steps: {total_steps:,}  time: {h}h{m}m{s}s  rate: {total_steps/elapsed:.0f} step/s")
+    print(f"  output: {args.output}")
+    print(f"{'='*60}")
+    if collected_samples:
+        counts = Counter(s["variant_name"] for s in collected_samples)
+        print("Per-variant collection stats:")
+        for name, count in sorted(counts.items()):
+            print(f"  {name}: {count} ({count/len(collected_samples)*100:.1f}%)")
+
+
+GRASP, ALIGN = 0, 1   # state-machine states; match ChainedEnv.phase's own 0/1 convention exactly
+
+
+def run_dp3_two_stage(env_unwrapped, simulation_app, args, cam1, cam2, cam3, cam2_pose_fn, dt, PERC,
+                      align_driver="dp3"):
+    """State machine over ChainedEnv.phase (0=GRASP, 1=ALIGN), one policy per state.
+
+    align_driver selects who drives ALIGN:
+      "dp3" (--stage2_dp3_ckpt): the align DP3 Student, on its own point cloud.
+      "rl"  (--stage2_rl):       the privileged RL stage2 teacher, on the env's 78-dim state obs.
+                                 GRASP is untouched, so this run and the "dp3" run differ ONLY in
+                                 who drives ALIGN -- the difference between their end-to-end rates
+                                 is the ALIGN distillation gap, and this run's rate is an upper
+                                 bound on what the Grasp Student's hand-off can support. No ALIGN
+                                 point cloud is built and cam2/cam3 are not updated in this mode
+                                 (the RL teacher reads simulator state, not depth).
+
+    Each DP3 state's camera composition AND workspace are HARDCODED to be byte-for-byte identical
+    to running that state standalone (--stage1_only / --stage2_only), since the two real checkpoints
+    were collected under exactly those standalone commands:
+
+      GRASP (0): cam1 alone (cam2 disabled) 2048 pts + robot 512 pts = 2560.
+                 workspace = PERC.workspace (the NARROW box). This is not a style choice: it is the
+                 actual box --stage1_only alone resolves to, because parse_args() computes the
+                 workspace default from args.chained, which is still False at that point even
+                 though --stage1_only later auto-enables it inside main() -- so a standalone
+                 `--stage1_only` run (no explicit --chained) has ALWAYS used the narrow box, and
+                 that's what the checkpoint's training data was collected under too. Using the WIDE
+                 chained_workspace here (an earlier version of this function did) crops a visibly
+                 different region of space and corrupts the point cloud from step 1.
+      ALIGN (1): cam2+cam3 fused 1024 pts (512 each) + robot 160 pts = 1184.
+                 workspace = PERC.chained_workspace (the WIDE box -- what --stage2_only/--chained
+                 resolve to; ALIGN needs to see the plate, which sits outside the narrow box).
+
+    Neither composition includes an oracle plate-crop segment (matching how both were collected).
+    ChainedEnv's own phase 0->1 switch (20-in-last-50 lenient success window, same criterion as
+    --collect_success_data, see tasks/chained_env.py) drives the transition; this function only
+    reacts to it -- swap which
+    checkpoint/camera-builder answers an env's next policy call, and reseed that env's observation
+    history from a clean read of the NEW state's own point cloud (a history built from GRASP's 2560
+    2-cam1-only points can't be reused for ALIGN's 1184 cam2+cam3 points, or vice versa)."""
+    from perception.target_drive import install_direct_drive, raw_to_target
+    from perception.student_obs import build_agent_pos
+    from perception.robot_pointcloud import RobotPointCloudFK
+    from collections import deque
+
+    align_is_rl = (align_driver == "rl")
+    tag = "HYBRID" if align_is_rl else "2STAGE"
+    # DP3 action_pred is already q*; the RL teacher's raw action needs raw_to_target(_drive_p).
+    # rate_limit only ever bites on the DP3 (GRASP) half -- the RL half's q* comes out of
+    # raw_to_target and already satisfies the same bound.
+    _drive_p = install_direct_drive(env_unwrapped, rate_limit=args.rate_limit)
+
+    _npz = args.robot_pc_npz if os.path.isabs(args.robot_pc_npz) else os.path.join(project_root, args.robot_pc_npz)
+    _body_names = list(env_unwrapped.franka.body_names)
+
+    # ---- per-state config, hardcoded -- see docstring ----
+    dp3_states = (GRASP,) if align_is_rl else (GRASP, ALIGN)
+    _fk_pts = {GRASP: 512, ALIGN: 160}
+    robot_fk = {s: RobotPointCloudFK(_npz, _body_names, args.device, max_points=_fk_pts[s])
+                for s in dp3_states}
+    cam_pts = {GRASP: 2048, ALIGN: 1024}
+    total_pc = {s: cam_pts[s] + robot_fk[s].num_points for s in dp3_states}
+    workspace = {GRASP: tuple(PERC.workspace), ALIGN: tuple(PERC.chained_workspace)}
+    ckpt_path = {GRASP: args.dp3_ckpt, ALIGN: args.stage2_dp3_ckpt}
+    state_name = {GRASP: "GRASP(stage1)", ALIGN: "ALIGN(stage2)"}
+
+    for s in dp3_states:
+        print(f"[{tag}] {state_name[s]}: {cam_pts[s]} cam pts + {robot_fk[s].num_points} robot pts = "
+              f"{total_pc[s]} pts, workspace={workspace[s]} | ckpt={ckpt_path[s]}", flush=True)
+    if args.pc_num_points != 1024 or args.disable_cam2 or args.robot_pc_points != 160:
+        print(f"[{tag}] NOTE: --pc_num_points/--disable_cam2/--robot_pc_points are ignored here "
+              "(each DP3 state's camera config is hardcoded, see above)", flush=True)
+
+    ck = {s: _load_dp3_ckpt_for_two_stage(ckpt_path[s], total_pc[s], args.device,
+                                          args.num_inference_steps, state_name[s])
+          for s in dp3_states}
+    for s in dp3_states:
+        n_obs, n_act, horizon = ck[s]["n_obs"], ck[s]["n_act"], ck[s]["horizon"]
+        if args.lag_comp < 0 or n_obs - 1 + args.lag_comp + n_act > horizon:
+            raise ValueError(f"lag_comp={args.lag_comp} invalid for {state_name[s]} ckpt "
+                             f"(need 0<=lag_comp and (n_obs-1)+lag_comp+n_act<=horizon)")
+    exec_n = {s: (ck[s]["n_act"] if args.exec_horizon is None
+                 else max(1, min(args.exec_horizon, ck[s]["n_act"]))) for s in dp3_states}
+
+    # ---- ALIGN driven by the privileged RL stage2 teacher ----
+    rl_agent = rl_obs = None
+    if align_is_rl:
+        rl_agent, _rl_obs_dim = _build_stage2_rl_player(env_unwrapped, args)
+        rl_obs = env_unwrapped._get_observations()["policy"]
+        if rl_obs.shape[1] != _rl_obs_dim:
+            raise ValueError(f"stage2 RL checkpoint expects obs dim {_rl_obs_dim} but the env "
+                             f"produces {rl_obs.shape[1]} -- is this really a stage2 (plate-pose "
+                             f"extended) checkpoint?")
+        rl_agent.get_batch_size(rl_obs, 1)
+        rl_agent.reset()
+        print(f"[{tag}] {state_name[ALIGN]}: privileged RL teacher, obs={_rl_obs_dim} dims, "
+              f"per-step (no action chunking) | ckpt={args.stage2_checkpoint}", flush=True)
+
+    env_origins = env_unwrapped.scene.env_origins
+
+    def build_obs(state):
+        """One frame of (point_cloud, agent_pos) for `state`, using ONLY that state's own hardcoded
+        camera composition + workspace -- never mixed with the other state's."""
+        ws = camera_crop_bounds(env_unwrapped.drill.data.root_pos_w, env_origins, PERC, workspace[state])
+        pcf = torch.zeros(args.num_envs, cam_pts[state], 3, device=args.device, dtype=torch.float32)
+        if state == GRASP:
+            pc1, _, _ = camera_pc(cam1, ws, cam_pts[GRASP], env_origins)
+            pcf[:, :] = pc1
+        else:
+            half = cam_pts[ALIGN] // 2
+            ws2 = raise_z_floor(ws, getattr(PERC, "wrist_cam_z_floor", None))
+            pc2, _, _ = camera_pc(cam2, ws2, half, env_origins, pose_w=cam2_pose_fn())
+            pc3, _, _ = camera_pc(cam3, ws, half, env_origins)
+            pcf[:, :half] = pc2
+            pcf[:, half:] = pc3
+        robot_pc = robot_fk[state](env_unwrapped.franka.data.body_pos_w, env_unwrapped.franka.data.body_quat_w,
+                                   env_origins)
+        pcf = torch.cat([pcf, robot_pc], dim=1)
+        agent_pos = build_agent_pos(env_unwrapped, ck[state]["with_force"])
+        return pcf, agent_pos
+
+    _hist_len = (max(ck[s]["n_obs"] for s in dp3_states)
+                 + max(ck[s]["n_act"] for s in dp3_states))
+    env_obs_histories = [deque(maxlen=_hist_len) for _ in range(args.num_envs)]
+    pending_actions = [None] * args.num_envs
+    pending_idx = [0] * args.num_envs
+
+    def reseed_history(e, state, pc_batch, agent_batch):
+        """Drop env e's leftover action chunk and refill its history from `state`'s own observation.
+        For an RL-driven ALIGN there is no history to refill (the teacher is per-step and memoryless);
+        clearing the pending chunk is the whole job, so the stale GRASP q* is never issued again."""
+        env_obs_histories[e].clear()
+        pending_actions[e] = None
+        pending_idx[e] = 0
+        if state not in dp3_states:
+            return
+        for _ in range(ck[state]["n_obs"]):
+            env_obs_histories[e].append({"agent_pos": agent_batch[e], "point_cloud": pc_batch[e]})
+
+    def update_cams():
+        cam1.update(dt)
+        if not align_is_rl:      # cam2/cam3 only feed the ALIGN point cloud
+            cam2.update(dt); cam3.update(dt)
+
+    def build_all_obs():
+        return {s: build_obs(s) for s in dp3_states}
+
+    update_cams()
+    state_now = env_unwrapped.phase.clone()
+    _obs_of = build_all_obs()
+    pc_of = {s: v[0] for s, v in _obs_of.items()}
+    agent_of = {s: v[1] for s, v in _obs_of.items()}
+    for e in range(args.num_envs):
+        s = int(state_now[e].item())
+        reseed_history(e, s, pc_of.get(s), agent_of.get(s))
+
+    total_episodes = successful_episodes = grasp_successful_episodes = stable_grasp_episodes = 0
+    ever_grasp = np.zeros(args.num_envs, dtype=bool)
+    grasp_switch_steps = []
+    success_log = []
+    episode_rewards = []
+    env_episode_rewards = torch.zeros(args.num_envs, device=args.device)
+    total_steps = 0
+    start_time = time.time()
+
+    print(f"\n[{tag}] rollout starting (target {args.num_episodes} episodes, {args.num_envs} envs)", flush=True)
+    sys.stdout.flush()
+
+    with torch.inference_mode():
+        while simulation_app.is_running() and total_episodes < args.num_episodes:
+            state_before = env_unwrapped.phase.clone()
+
+            need = {s: [] for s in dp3_states}
+            for e in range(args.num_envs):
+                s = int(state_before[e].item())
+                if s in dp3_states and (pending_actions[e] is None or pending_idx[e] >= exec_n[s]):
+                    need[s].append(e)
+
+            for s in dp3_states:
+                if not need[s]:
+                    continue
+                n_obs, n_act = ck[s]["n_obs"], ck[s]["n_act"]
+                obs_batch, pc_batch = [], []
+                for e in need[s]:
+                    hist = list(env_obs_histories[e])[-n_obs:]
+                    if len(hist) < n_obs:
+                        hist = [hist[0]] * (n_obs - len(hist)) + hist
+                    obs_batch.append(torch.stack([h["agent_pos"] for h in hist]))
+                    pc_batch.append(torch.stack([h["point_cloud"] for h in hist]))
+                obs_dict = {"agent_pos": torch.stack(obs_batch), "point_cloud": torch.stack(pc_batch)}
+                result = ck[s]["policy_ema"].predict_action(obs_dict)
+                cs = n_obs - 1 + args.lag_comp
+                chunks = result["action_pred"][:, cs:cs + n_act]
+                for i, e in enumerate(need[s]):
+                    pending_actions[e] = chunks[i]
+                    pending_idx[e] = 0
+
+            # ALIGN-by-RL: the teacher outputs raw [-1,1], so it needs the same raw->q* mapping the
+            # collector/teacher-eval use. Computed for the whole batch (raw_to_target is pure and
+            # cheap); only the rows of envs currently in ALIGN are actually taken below.
+            rl_q = None
+            if align_is_rl:
+                traw = rl_agent.get_action(rl_agent.obs_to_torch(rl_obs), is_deterministic=True)
+                if not isinstance(traw, torch.Tensor):
+                    traw = torch.from_numpy(np.array(traw)).float().to(args.device)
+                rl_q = raw_to_target(traw, env_unwrapped.cur_targets.clone(), _drive_p)
+
+            actions = torch.zeros((args.num_envs, 13), device=args.device, dtype=torch.float32)
+            for e in range(args.num_envs):
+                if align_is_rl and int(state_before[e].item()) == ALIGN:
+                    actions[e] = rl_q[e]
+                elif pending_actions[e] is not None:
+                    actions[e] = pending_actions[e][pending_idx[e]]
+                    pending_idx[e] += 1
+
+            env_unwrapped._direct_target = actions
+            obs_dict_step, rewards, terminated, truncated, _ = env_unwrapped.step(actions)
+            total_steps += 1
+            if align_is_rl:
+                rl_obs = obs_dict_step["policy"] if isinstance(obs_dict_step, dict) else obs_dict_step
+
+            update_cams()
+
+            state_after = env_unwrapped.phase.clone()
+            just_switched = (state_before == GRASP) & (state_after == ALIGN)
+
+            _obs_of = build_all_obs()
+            for s, v in _obs_of.items():
+                pc_of[s], agent_of[s] = v
+
+            env_episode_rewards += rewards
+            is_done = terminated.bool() | truncated.bool()
+            try:
+                lenient_success = env_unwrapped._cached_lenient_success
+            except AttributeError:
+                lenient_success = torch.zeros(args.num_envs, dtype=torch.bool, device=args.device)
+            _inst = getattr(env_unwrapped, "_cached_instant_success", None)
+            if _inst is not None:
+                ever_grasp |= _inst.detach().cpu().numpy().astype(bool)
+
+            finished = torch.where(is_done)[0]
+            for env_idx in finished:
+                e = env_idx.item()
+                total_episodes += 1
+                episode_rewards.append(env_episode_rewards[e].item())
+                if lenient_success[e]:
+                    successful_episodes += 1; success_log.append(1)
+                else:
+                    success_log.append(0)
+                if ever_grasp[e]:
+                    grasp_successful_episodes += 1
+                ever_grasp[e] = False
+                sw = int(env_unwrapped._last_episode_switch_step[e].item())
+                if sw >= 0:
+                    stable_grasp_episodes += 1; grasp_switch_steps.append(sw)
+                env_episode_rewards[e] = 0.0
+                reseed_history(e, GRASP, pc_of[GRASP], agent_of[GRASP])   # reset -> always back to GRASP
+            if align_is_rl and len(finished) > 0:
+                rl_agent.reset()   # same per-episode player reset as run_rl_teacher_eval
+
+            for e in range(args.num_envs):
+                if is_done[e]:
+                    continue
+                if just_switched[e]:
+                    # GRASP->ALIGN this step: discard GRASP's leftover chunk + history, reseed with
+                    # ALIGN's OWN camera composition so the next policy call is ALIGN's.
+                    # (align_driver="rl": nothing to reseed, the chunk is just dropped.)
+                    reseed_history(e, ALIGN, pc_of.get(ALIGN), agent_of.get(ALIGN))
+                else:
+                    s = int(state_after[e].item())
+                    if s in dp3_states:
+                        env_obs_histories[e].append({"agent_pos": agent_of[s][e],
+                                                     "point_cloud": pc_of[s][e]})
+
+            if total_steps % 100 == 0:
+                elapsed = time.time() - start_time
+                sr = successful_episodes / max(total_episodes, 1) * 100
+                n_align = int((state_after == ALIGN).sum().item())
+                print(f"  step={total_steps} | eps={total_episodes}/{args.num_episodes} "
+                      f"| succ={successful_episodes} ({sr:.1f}%) | grasp={grasp_successful_episodes} "
+                      f"stable={stable_grasp_episodes} | in_align={n_align}/{args.num_envs} "
+                      f"| {total_steps/elapsed:.1f} step/s", flush=True)
+                sys.stdout.flush()
+
+    elapsed = time.time() - start_time
+    m, sec = divmod(int(elapsed), 60); h, m = divmod(m, 60)
+    print(f"\n{'='*60}")
+    print(f"[{tag}] === state-machine results: GRASP=DP3, "
+          f"ALIGN={'privileged RL teacher' if align_is_rl else 'DP3'} ===")
+    if total_episodes > 0:
+        print(f"Success rate: {successful_episodes/total_episodes*100:.1f}%")
+        _gr = grasp_successful_episodes / total_episodes * 100
+        _sr2 = stable_grasp_episodes / total_episodes * 100
+        print(f"Grasp success (>=1 step): {grasp_successful_episodes} ({_gr:.1f}%)")
+        print(f"Grasp stable (entered ALIGN): {stable_grasp_episodes} ({_sr2:.1f}%)")
+        if stable_grasp_episodes > 0:
+            print(f"Align | stable: {successful_episodes/stable_grasp_episodes*100:.1f}%")
+        if grasp_switch_steps:
+            _ss = np.array(grasp_switch_steps)
+            print(f"Switch step (time to stable grasp): mean={_ss.mean():.0f} "
+                  f"median={np.median(_ss):.0f} max={_ss.max()} steps")
+    if episode_rewards:
+        ep = np.array(episode_rewards)
+        print(f"Reward: mean={ep.mean():.1f} max={ep.max():.1f} min={ep.min():.1f}")
+    print(f"Time: {h}h{m}m{sec}s, {total_steps/elapsed:.0f} steps/s")
+    if success_log:
+        print(f"Success log: {success_log}")
+    print(f"{'='*60}")
 
 
 def main():
     args = parse_args()
 
-    if not os.path.exists(args.dp3_ckpt):
+    if args.stage2_rl:
+        if args.stage2_dp3_ckpt is not None:
+            print("[ERROR] --stage2_rl and --stage2_dp3_ckpt both claim the ALIGN state; pick one "
+                  "(--stage2_rl = privileged RL teacher, --stage2_dp3_ckpt = align DP3 student)",
+                  flush=True)
+            return
+        if args.stage1_only or args.stage2_only or args.dual or args.policy == "rl" \
+                or args.collect_success_data:
+            print("[ERROR] --stage2_rl is mutually exclusive with --stage1_only/--stage2_only/"
+                  "--dual/--policy rl/--collect_success_data (it is its own state machine: DP3 "
+                  "drives GRASP, the RL stage2 teacher drives ALIGN)", flush=True)
+            return
+        _s2 = args.stage2_checkpoint if os.path.isabs(args.stage2_checkpoint) \
+            else os.path.join(project_root, args.stage2_checkpoint)
+        if not os.path.exists(_s2):
+            print(f"[ERROR] --stage2_rl needs the RL stage2 checkpoint, not found: {_s2}", flush=True)
+            return
+        if not args.chained:
+            args.chained = True
+            print("[INFO] --stage2_rl: auto-enable --chained (needed for the phase 0->1 switch)",
+                  flush=True)
+        print("[INFO] --stage2_rl: hybrid deploy. GRASP driven by DP3 (--dp3_ckpt) via cam1 alone "
+              "(2048+robot512=2560, hardcoded, same as --stage2_dp3_ckpt); on the same phase 0->1 "
+              "switch, ALIGN is driven by the PRIVILEGED RL stage2 teacher on the env's state obs. "
+              "End-to-end success here is an upper bound on what the Grasp Student's hand-off "
+              "supports; the gap to a --stage2_dp3_ckpt run is the ALIGN distillation gap",
+              flush=True)
+
+    if args.stage2_dp3_ckpt is not None:
+        if args.stage1_only or args.stage2_only:
+            print("[ERROR] --stage2_dp3_ckpt (two-stage DP3 deploy) is mutually exclusive with "
+                  "--stage1_only/--stage2_only", flush=True)
+            return
+        if args.dual or args.policy == "rl":
+            print("[ERROR] --stage2_dp3_ckpt does not support --dual/--policy rl (those paths assume "
+                  "a single checkpoint/dual-RL-teacher setup); use plain DP3 inference "
+                  "(default --policy dp3, no --dual)", flush=True)
+            return
+        if not os.path.exists(args.stage2_dp3_ckpt):
+            print(f"[ERROR] stage2 DP3 checkpoint not found: {args.stage2_dp3_ckpt}", flush=True)
+            return
+        if not args.chained:
+            args.chained = True
+            print("[INFO] --stage2_dp3_ckpt: auto-enable --chained (needed for the phase 0->1 switch)",
+                  flush=True)
+        print("[INFO] --stage2_dp3_ckpt: two-stage DP3 deploy. stage1 (--dp3_ckpt) drives grasp via "
+              "cam1 alone (2048+robot512=2560, hardcoded); on stage1 success, stage2 "
+              "(--stage2_dp3_ckpt) takes over via cam2+cam3 (1024+robot160=1184, hardcoded)",
+              flush=True)
+
+    if args.collect_success_data:
+        if args.stage2_dp3_ckpt is not None or args.stage2_only:
+            print("[ERROR] --collect_success_data is mutually exclusive with "
+                  "--stage2_dp3_ckpt/--stage2_only", flush=True)
+            return
+        if args.dual or args.policy == "rl":
+            print("[ERROR] --collect_success_data does not support --dual/--policy rl "
+                  "(needs the DP3 GRASP checkpoint driving directly)", flush=True)
+            return
+        if not args.stage1_only:
+            args.stage1_only = True
+            print("[INFO] --collect_success_data: auto-enable --stage1_only "
+                  "(same env/checkpoint/camera composition as that path)", flush=True)
+
+    if args.stage2_only:
+        if args.chained or args.stage1_only:
+            print("[ERROR] --stage2_only uses Stage2Env directly and is mutually exclusive with "
+                  "--chained/--stage1_only (those use ChainedEnv)", flush=True)
+            return
+        if args.dual or args.policy == "rl":
+            print("[ERROR] --stage2_only does not support --dual/--policy rl (those paths assume "
+                  "--chained's cam1+cam2+plate layout and stage1/stage2 dual-teacher checkpoints); "
+                  "use plain DP3 inference (default --policy dp3, no --dual)", flush=True)
+            return
+        if not os.path.exists(args.success_dataset):
+            print(f"[ERROR] --success_dataset not found: {args.success_dataset} "
+                  f"(generate with scripts/collect_success_data.py, or pass --success_dataset)", flush=True)
+            return
+        print("[INFO] --stage2_only: Stage2Env, drill starts already grasped (from --success_dataset), "
+              "DP3 policy drives alignment, camera segment = cam2+cam3", flush=True)
+    # stage1_only reuses ChainedEnv + wrist camera (same as collect), but cam3 is off (no plate segment).
+    # passing --stage1_only alone auto-forces chained (otherwise it uses GraspDrillEnv and cam2 becomes a fixed camera).
+    elif args.stage1_only and not args.chained:
+        args.chained = True
+        _cam_desc = "cam1 alone" if args.disable_cam2 else "cam1+cam2 fused"
+        print(f"[INFO] --stage1_only: auto-enable ChainedEnv + wrist camera, cam3 off (no plate segment). "
+              f"camera segment={args.pc_num_points} pts ({_cam_desc}) + robot (up to {args.robot_pc_points} pts "
+              f"if --pc_mode robot) -- exact total printed once the checkpoint's expected point_cloud is "
+              f"checked against it below", flush=True)
+
+    if args.policy == "dp3" and not os.path.exists(args.dp3_ckpt):
         print(f"[ERROR] DP3 checkpoint not found: {args.dp3_ckpt}")
         return
 
@@ -265,41 +1082,59 @@ def main():
     app_launcher = AppLauncher(headless=args.headless, enable_cameras=True)
     simulation_app = app_launcher.app
 
+    _exit_code = 0                             # for hard exit; set to 1 on exception so the outer script can tell
     try:
         import carb
         import omni.timeline
         import omni.usd
         from tasks.grasp_drill_env import GraspDrillEnv, create_grasp_drill_env_cfg
 
-        # Import rl_games AFTER torch.compile is neutralized (see top of file).
-        from rl_games.common import env_configurations, vecenv
-        from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper
-
-        # 从干净 stage 开始（与采集脚本一致）
         omni.usd.get_context().new_stage()
 
-        # ---------- Env cfg ----------
         cfg = create_grasp_drill_env_cfg(
             num_envs=args.num_envs,
             device=args.device,
             headless=args.headless,
             debug=args.debug,
             drill_config_path=args.drill_configs,
+            drill_variants_path=args.drill_variants,
             img_height=args.img_height,
             img_width=args.img_width,
             enable_cameras=True,
+            # stage2_only: needs plate + cam3 too (cam3 is one of the two main camera views, fused with cam2).
+            include_plate=args.chained or args.stage2_only,
+            include_plate_camera=args.chained or args.stage2_only,
+            # stage1_only: cam2 is still the wrist camera, plate object present, but cam3 not built -> no plate segment
+            include_cam3=(args.chained and not args.stage1_only) or args.stage2_only,
         )
         cfg.seed = args.seed
         cfg.log_dir = os.path.dirname(args.dp3_ckpt)
+        if args.chained or args.stage2_only:
+            cfg.episode_length_s = args.episode_length_s
 
-        for _cn in ("cam1", "cam2"):  
-            _c = getattr(cfg.scene, _cn, None)
-            if _c is not None and "rgb" not in _c.data_types:
-                _c.data_types = ["rgb"] + list(_c.data_types)
+        ensure_rgb_aov(cfg.scene)   # depth-only TiledCamera may deadlock on the first frame
 
-        base_env = GraspDrillEnv(cfg=cfg, debug=args.debug)
+        if args.stage2_only:
+            from tasks.stage2_env import get_stage2_env_class, SuccessDataDataset
+            Stage2Env = get_stage2_env_class()
+            success_dataset = SuccessDataDataset(args.success_dataset)
+            base_env = Stage2Env(cfg=cfg, debug=args.debug, success_dataset=success_dataset,
+                                 success_hold_stop=args.success_hold_stop)
+            print(f"[STAGE2] Stage2Env: drill starts already grasped ({len(success_dataset)} pkl samples), "
+                  f"DP3 policy drives alignment, terminates early after {args.success_hold_stop} "
+                  f"consecutive aligned steps (episode cap={args.episode_length_s}s)", flush=True)
+        elif args.chained:
+            from tasks.chained_env import get_chained_env_class
+            ChainedEnv = get_chained_env_class()
+            base_env = ChainedEnv(cfg=cfg, debug=args.debug,
+                                  success_hold_stop=args.success_hold_stop,
+                                  stage1_only=args.stage1_only)
+        else:
+            base_env = GraspDrillEnv(cfg=cfg, debug=args.debug)
         env_unwrapped = base_env.unwrapped
 
+        _exam_res = None   # set below when --init_pose_file given: {vid: int8 array of -1(not run)/0(fail)/1(success)}
+        _EXAM_N = int(args.exam_n)   # sequential exam: run each variant's first N saved poses in stored order, exactly once
         if args.init_pose_file is not None:
             _ip = np.load(args.init_pose_file)
             _vids = _ip["variant"]; _pos = _ip["pos_local"]; _quat = _ip["quat"]; _goal = _ip["goal_quat"]
@@ -307,75 +1142,107 @@ def main():
             for _k in np.unique(_vids):
                 _m = _vids == _k
                 _by_variant[int(_k)] = (
-                    torch.from_numpy(_pos[_m]).float(),
-                    torch.from_numpy(_quat[_m]).float(),
-                    torch.from_numpy(_goal[_m]).float())
-            # 每个 variant 从自己保存的位姿里【随机】抽一条(不再按保存顺序游标读)。
-            # 用 args.seed 固定的独立 RNG,保证随机但可复现(同 seed 同序列)。
-            _ip_rng = np.random.default_rng(args.seed)
-            print(f"[INFO] init-pose replay (RANDOM per-variant, seed={args.seed}): "
-                  f"{len(_vids)} poses, per-variant counts="
+                    torch.from_numpy(_pos[_m]).float()[:_EXAM_N],
+                    torch.from_numpy(_quat[_m]).float()[:_EXAM_N],
+                    torch.from_numpy(_goal[_m]).float()[:_EXAM_N])
+            # sequential-exam state: each variant runs its first N poses in stored order, exactly once.
+            _exam_res = {vid: -np.ones(P.shape[0], dtype=np.int8) for vid, (P, Q, G) in _by_variant.items()}
+            _exam_next = {vid: 0 for vid in _by_variant}          # per-variant cursor into its pose list
+            _env_item = [(-1, -1)] * args.num_envs                 # exam item each env is currently running (-1,-1=filler)
+            _exam_total = sum(int(P.shape[0]) for (P, Q, G) in _by_variant.values())
+
+            def _exam_pending():
+                # the actual stop condition for the exam: True until every variant's first
+                # _EXAM_N poses have been graded. Deliberately independent of args.num_episodes
+                # (that flag only bounds the non-exam / no-init_pose_file fallback path below).
+                return not all((r != -1).all() for r in _exam_res.values())
+
+            def _exam_graded_count():
+                return sum(int((r != -1).sum()) for r in _exam_res.values())
+
+            print(f"[INFO] init-pose replay (SEQUENTIAL exam, first {_EXAM_N}/variant, deterministic): "
+                  f"{_exam_total} poses total, per-variant counts="
                   f"{ {k: v[0].shape[0] for k, v in _by_variant.items()} }", flush=True)
 
+            # env<->variant assignment is fixed for the whole run (env_id % num_variants, see
+            # GraspDrillEnv._reset_idx), so once a variant's exam poses run out, the same envs keep
+            # getting reassigned to it. Freeze those envs instead of re-running them on a filler pose:
+            # force terminated/truncated=False forever (never resets again -> never draws a new pose,
+            # never starts another episode) and hold their current joint targets in the main loop below.
+            _frozen = torch.zeros(args.num_envs, dtype=torch.bool, device=args.device)
+            _orig_get_dones_exam = env_unwrapped._get_dones
+
+            def _get_dones_freeze_exhausted():
+                terminated, truncated = _orig_get_dones_exam()
+                terminated = terminated & ~_frozen
+                truncated = truncated & ~_frozen
+                return terminated, truncated
+
+            env_unwrapped._get_dones = _get_dones_freeze_exhausted
+
             def _drill_pose_override_fn(env_ids, variant_ids):
+                # called at each reset. For each env: (1) record the result of the exam item it just
+                # finished (via _cached_lenient_success, already set by _get_dones before this reset),
+                # (2) hand it the next sequential pose of its variant, or freeze it once that variant
+                # is done (see _get_dones_freeze_exhausted / the main loop's action override).
                 n = len(env_ids)
                 pos = torch.zeros(n, 3); quat = torch.zeros(n, 4); goal = torch.zeros(n, 4)
+                _suc = getattr(env_unwrapped, "_cached_lenient_success", None)   # just-ended success per env
                 for i in range(n):
+                    e = int(env_ids[i].item())
+                    vp, ip = _env_item[e]
+                    if vp >= 0 and _exam_res[vp][ip] == -1:      # record once per item
+                        _exam_res[vp][ip] = 1 if (_suc is not None and bool(_suc[e].item())) else 0
                     vid = int(variant_ids[i].item())
                     if vid not in _by_variant:
-                        raise RuntimeError(f"init_pose_file 缺少 variant {vid} 的记录位姿;"
-                                           f"deploy 的 active variants 须与 collect 一致")
+                        raise RuntimeError(f"init_pose_file is missing recorded poses for variant {vid};"
+                                           f"deploy's active variants must match collect")
                     P, Q, G = _by_variant[vid]
-                    c = int(_ip_rng.integers(0, P.shape[0]))   # 从该 variant 的全部保存位姿里随机抽
-                    pos[i] = P[c]; quat[i] = Q[c]; goal[i] = G[c]
+                    j = _exam_next[vid]
+                    if j < P.shape[0]:
+                        _exam_next[vid] += 1
+                        _env_item[e] = (vid, j)
+                        idx = j
+                    else:
+                        _env_item[e] = (-1, -1)   # this variant's exam done -> freeze this env
+                        _frozen[e] = True
+                        idx = 0
+                    pos[i] = P[idx]; quat[i] = Q[idx]; goal[i] = G[idx]
                 return pos, quat, goal
 
             env_unwrapped._drill_pose_override_fn = _drill_pose_override_fn
 
-        # 删除 MultiAssetSpawner 留下的模板原型，避免场景中出现多余的物体
+        if args.fixed_plate:
+            _fp_pos = torch.tensor([0.0, 1.0, 0.5], device=args.device)   # matches _randomize_plate default base
+            _fp_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=args.device)
+
+            def _plate_pose_override_fn(env_ids):
+                n = len(env_ids)
+                return _fp_pos.unsqueeze(0).expand(n, -1), _fp_quat.unsqueeze(0).expand(n, -1)
+
+            env_unwrapped._plate_pose_override_fn = _plate_pose_override_fn
+            print("[INFO] --fixed_plate: plate pinned at (0,1,0.5) default base, no random jitter each reset",
+                  flush=True)
+
         from isaaclab.sim.utils import delete_prim
-        try:
-            delete_prim("/World/Template")
-        except Exception as e:
-            print(f"[WARN] 删除 /World/Template 失败: {e}")
+        delete_prim("/World/Template")
 
-        settings = carb.settings.get_settings()
-        settings.set("/app/player/useFixedTimeStepping", True)
-        settings.set("/app/player/targetFrameRate", int(1.0 / env_unwrapped.step_dt))
-        settings.set("/app/runLoops/rendering_0/rateLimitEnabled", True)
-        settings.set("/app/runLoops/rendering_0/rateLimit", 60)
-        settings.set("/physics/updateToUsd", False)
-        settings.set("/physics/updateParticlesToUsd", False)
-        settings.set("/app/runLoops/main/enabled", True)
-        settings.set("/app/runLoops/main/syncTooFast", True)
 
-        # reset BEFORE timeline.play()
-        print("[INFO] Resetting environment (before play)...", flush=True)
+        apply_render_settings(env_unwrapped.step_dt)   # without these carb settings, the first step() render deadlocks
+
         env_unwrapped.reset()
 
-        # Create RlGamesVecEnvWrapper (matches collect_dp3_data.py order)
-        clip_obs = math.inf
-        clip_actions = 1.0
-        env = RlGamesVecEnvWrapper(base_env, args.device, clip_obs, clip_actions)
-
-        vecenv.register(
-            "IsaacRlgWrapper",
-            lambda config_name, num_actors, **kw: RlGamesGpuEnv(config_name, num_actors, **kw),
-        )
-        env_configurations.register(
-            "rlgpu",
-            {"vecenv_type": "IsaacRlgWrapper", "env_creator": lambda **kw: env},
-        )
-
         dt = env_unwrapped.step_dt
-        cam1 = env_unwrapped.scene.sensors.get("cam1")
-        cam2 = env_unwrapped.scene.sensors.get("cam2")
-        if cam1 is None or cam2 is None:
-            raise RuntimeError(
-                f"Expected env-managed cameras 'cam1'/'cam2', got "
-                f"sensors={list(env_unwrapped.scene.sensors.keys())}"
-            )
-        # cam1=30cm跟随框, cam2=固定工作区(不跟随)
+        # for stage1_only cam3 is not built (need_cam3=False), cam2 is still the wrist camera.
+        # stage2_only needs cam3 too (fused with cam2 as the camera segment).
+        cam1, cam2, cam3 = get_cameras(env_unwrapped, chained=args.chained,
+                                       need_cam3=(args.chained and not args.stage1_only) or args.stage2_only)
+        # whether there is a plate segment: chained and cam3 actually exists. stage1_only -> cam3=None -> no plate segment.
+        _use_plate = args.chained and (cam3 is not None)
+        _cam2_on_body = detect_wrist_cam(env_unwrapped, cam2)
+
+        def _cam2_pose():
+            return wrist_cam_pose_w(env_unwrapped.franka, cam2) if _cam2_on_body else None
 
         timeline = omni.timeline.get_timeline_interface()
         timeline.play()
@@ -384,18 +1251,28 @@ def main():
             print("[ERROR] simulation_app.is_running() is False before loop!")
             return
 
-        # reset AFTER play: use wrapped env (env), NOT env_unwrapped.
-        # env_unwrapped.reset() would also work here but the wrapped version
-        # is consistent with collect_dp3_data.py and properly initializes cameras.
-        _obs = env.reset()
-
-        # Also call env_unwrapped.reset() once more after play() to get raw obs
-        # and to finalize camera initialization. This is safe because cameras
-        # are now initialized and the render loop is running.
         _, _ = env_unwrapped.reset()
 
-        # ---------- 完整机器人/电钻点云(按 --pc_mode,与 collect_dp3_data.py 对齐)----------
-        from perception.robot_pointcloud import RobotPointCloudFK, _quat_to_mat
+        # ---- RL teacher mode: same eval env, same init_pose, same success counting, only policy swapped, measure pure gap ----
+        if args.policy == "rl":
+            run_rl_teacher_eval(env_unwrapped, simulation_app, args)
+            return   # trigger the outer finally (timeline.stop + app.close + os._exit)
+
+        # ---- two-stage DP3 state machine: GRASP ckpt (cam1 alone) drives grasp; on ChainedEnv's
+        # phase 0->1 switch (stage1 success) ALIGN ckpt (cam2+cam3) takes over driving alignment.
+        # Camera composition + workspace per state are hardcoded inside run_dp3_two_stage (not
+        # derived from args.workspace here) -- see that function's docstring for why.
+        if args.stage2_dp3_ckpt is not None or args.stage2_rl:
+            run_dp3_two_stage(env_unwrapped, simulation_app, args, cam1, cam2, cam3, _cam2_pose,
+                              dt, _load_perception_hp(),
+                              align_driver=("rl" if args.stage2_rl else "dp3"))
+            return   # trigger the outer finally (timeline.stop + app.close + os._exit)
+
+        if args.collect_success_data:
+            run_collect_success_data(env_unwrapped, simulation_app, args, cam1, _load_perception_hp())
+            return   # trigger the outer finally (timeline.stop + app.close + os._exit)
+
+        from perception.robot_pointcloud import RobotPointCloudFK
         robot_fk = None
         robot_pc_M = 0
         if args.save_robot_pc:
@@ -406,92 +1283,113 @@ def main():
             robot_fk = RobotPointCloudFK(_npz, list(env_unwrapped.franka.body_names), args.device,
                                          max_points=_rmax)
             robot_pc_M = robot_fk.num_points
+        drill_mesh_fk = None
         drill_M = 0
-        drill_canonical = None
-        if args.save_drill_pc:
-            drill_M = args.drill_pc_points
-            _va = env_unwrapped._variant_attrs
-            _vids = env_unwrapped._drill_variant_indices
-            _var_canon = {}
-            for _vid, _vdata in _va.items():
-                _mp = _vdata.get("mesh_points")
-                _scale = _vdata["scale"]
-                if _mp is None or len(_mp) == 0:
-                    _pts = torch.zeros(drill_M, 3, device=args.device)
-                else:
-                    _N = _mp.shape[0]
-                    _idx = (torch.randperm(_N, device=_mp.device)[:drill_M] if _N >= drill_M
-                            else torch.randint(0, _N, (drill_M,), device=_mp.device))
-                    _pts = (_mp[_idx] * _scale).to(args.device)
-                _var_canon[int(_vid)] = _pts
-            drill_canonical = torch.stack([_var_canon[int(v.item())] for v in _vids], dim=0)
-        # 合成地面/桌面点云(默认开,与 collect 同一套参数+同一抖动分布)
-        from perception.robot_pointcloud import make_ground_points, jitter_ground_xy
+        if args.save_drill_mesh_pc and args.drill_mesh_points > 0:
+            from perception.drill_pointcloud import DrillMeshPointCloudFK
+            drill_mesh_fk = DrillMeshPointCloudFK(env_unwrapped, num_points=args.drill_mesh_points,
+                                                  device=args.device)
+            drill_M = drill_mesh_fk.num_points
+        from perception.robot_pointcloud import jitter_ground_xy
         _PERC = _load_perception_hp()
-        ground_M = _PERC.ground_points
-        _ground_pts = make_ground_points(tuple(args.workspace), ground_M, _PERC.ground_z, args.device)
-        ground_batch = _ground_pts.unsqueeze(0).expand(args.num_envs, -1, -1)  # (B,G,3) 网格基准
-        _ground_xy_std = float(getattr(_PERC, "ground_xy_noise_std", 0.0))     # xy 每帧高斯抖动 σ(同 collect)
-        total_pc = args.pc_num_points + robot_pc_M + drill_M + ground_M
-        print(f"[INFO] pc_mode={args.pc_mode} -> total_pc={total_pc} "
-              f"(camera={args.pc_num_points} + robot={robot_pc_M} + drill={drill_M} + ground={ground_M}) "
-              f"| 须与训练数据点数一致", flush=True)
+        ground_batch, ground_M, _ground_xy_std = setup_ground(args.num_envs, args.workspace, args.device,
+                                                              num_points=args.ground_points)
+        plate_M = args.plate_pc_points if _use_plate else 0   # stage1_only (cam3 off) -> 0, no plate segment
+        total_pc = args.pc_num_points + plate_M + robot_pc_M + drill_M + ground_M
+
+        _last_pc3 = None   # reuse cache for empty cam3 frames (only when there is a plate segment)
 
         def append_robot_drill(pc_cam):
-            """pc_cam:(B,pc_num_points,3) env-local 相机云。按 collect 的顺序
-            [camera | robot | drill | ground] 拼接(机器人 FK + 真值位姿电钻 + 合成地面)。"""
+            """pc_cam: (B,pc_num_points,3) env-local camera cloud. Concatenated in collect's order:
+            [camera | plate (only when there is a plate segment) | robot | drill | ground]."""
+            nonlocal _last_pc3
             parts = [pc_cam]
+            if _use_plate:
+                pc_plate, _zm3, _ = build_plate_cam_pc(
+                    cam3, env_unwrapped.plate.data.root_pos_w,
+                    env_unwrapped.scene.env_origins, plate_M)
+                if _last_pc3 is not None:
+                    pc_plate = torch.where(_zm3.view(-1, 1, 1), _last_pc3, pc_plate)
+                _last_pc3 = pc_plate
+                parts.append(pc_plate)
             if args.save_robot_pc:
                 parts.append(robot_fk(env_unwrapped.franka.data.body_pos_w,
                                       env_unwrapped.franka.data.body_quat_w,
                                       env_unwrapped.scene.env_origins))
-            if args.save_drill_pc:
-                _dq = env_unwrapped.drill.data.root_quat_w
-                _dp = env_unwrapped.drill.data.root_pos_w
-                _Rd = _quat_to_mat(_dq)
-                _dw = torch.einsum('bij,bnj->bni', _Rd, drill_canonical) + _dp.unsqueeze(1)
-                parts.append(_dw - env_unwrapped.scene.env_origins.unsqueeze(1))
-            # 合成地面(默认开,接最后):xy 每帧高斯抖动(z 不变,clamp 回区域),与 collect 同分布
+            if drill_mesh_fk is not None:
+                parts.append(drill_mesh_fk(env_unwrapped.drill.data.root_pos_w,
+                                           env_unwrapped.drill.data.root_quat_w,
+                                           env_unwrapped._drill_variant_indices,
+                                           env_unwrapped.scene.env_origins))
             _ws = args.workspace
             parts.append(jitter_ground_xy(ground_batch, _ground_xy_std,
                                           _ws[0], _ws[1], _ws[2], _ws[3]))
             return torch.cat(parts, dim=1)
 
-        # Warm-up: capture initial camera readings for observation histories.
-        # This mirrors collect_dp3_data.py where cam.update() is called right
-        # after reset to get the first valid point cloud.
-        _sim_pc_per_cam = args.pc_num_points // 2    # 每相机 1024
+        # ---- 4-channel (xyz+mask) support: when ckpt point cloud channels==4, add GT handle mask to the camera segment ----
+        # with_mask is auto-set True by ckpt point_cloud.shape[-1]==4 (see detection after ckpt load below),
+        # same approach as auto-detecting force; 3-channel ckpt is unaffected (add_mask_channel returns as-is).
+        with_mask = False
+        # same module collect uses -> byte-identical label definition and the same default threshold
+        from perception.groundtruth_mask import add_mask_channel as _gt_add_mask_channel
+
+        def add_mask_channel(pc_now):
+            """pc_now: (B,total_pc,3) -> (B,total_pc,4)=[xyz|is_handle], only when with_mask.
+            Sim-only: the label comes from the drill's GT pose + the variant's body_mask (on the real
+            robot replace this call with a segmentation network's output)."""
+            if not with_mask:
+                return pc_now
+            return _gt_add_mask_channel(pc_now, env_unwrapped, args.pc_num_points,
+                                        plate_M=plate_M, robot_pc_M=robot_pc_M,
+                                        threshold=args.mask_threshold,
+                                        use_robot_seg=args.save_robot_pc)
+
+        _sim_pc_per_cam = args.pc_num_points if args.disable_cam2 else args.pc_num_points // 2
         _workspace = tuple(args.workspace)
         cam1.update(dt)
         cam2.update(dt)
-        # 裁剪框由 _PERC.camera_follow_drill 决定(当前=False -> 两相机都用固定 workspace);
-        # 单一真源 camera_crop_bounds + camera_pc,与 collect 完全一致。
+        if cam3 is not None:
+            cam3.update(dt)
         _ws_init = camera_crop_bounds(env_unwrapped.drill.data.root_pos_w,
                                       env_unwrapped.scene.env_origins, _PERC, _workspace)
-        pc1_init, _, _ = camera_pc(cam1, _ws_init, _sim_pc_per_cam, env_unwrapped.scene.env_origins)
-        pc2_init, _, _ = camera_pc(cam2, _ws_init, _sim_pc_per_cam, env_unwrapped.scene.env_origins)
-        # 相机空帧"沿用上一帧"的 per-cam 滚动缓存,初值取 warm-up 云(见主循环说明)。
-        _last_pc1 = pc1_init
-        _last_pc2 = pc2_init
         pc_fused_init = torch.zeros(args.num_envs, args.pc_num_points, 3, device=args.device, dtype=torch.float32)
-        pc_fused_init[:, :_sim_pc_per_cam] = pc1_init   # cam1 30cm 跟随
-        pc_fused_init[:, _sim_pc_per_cam:] = pc2_init   # cam2 30cm 跟随(同框,异视角)
-        # 相机云(pc_num_points)后追加 FK机器人/电钻云 -> 与训练数据同布局
+        if args.stage2_only:
+            # camera segment = cam2 (wrist) + cam3 (plate), cam1 not sampled (same convention as
+            # collect_dp3_data.py --stage2_only).
+            _half = args.pc_num_points // 2
+            _sim_pc_per_cam = _half
+            _ws_init_cam2 = raise_z_floor(_ws_init, getattr(_PERC, "wrist_cam_z_floor", None))
+            pc2_init, _, _ = camera_pc(cam2, _ws_init_cam2, _half, env_unwrapped.scene.env_origins,
+                                       pose_w=_cam2_pose())
+            pc3_init, _, _ = camera_pc(cam3, _ws_init, _half, env_unwrapped.scene.env_origins)
+            _last_pc1 = None
+            _last_pc2 = pc2_init
+            _last_pc3_stage2 = pc3_init
+            pc_fused_init[:, :_half] = pc2_init
+            pc_fused_init[:, _half:] = pc3_init
+        else:
+            pc1_init, _, _ = camera_pc(cam1, _ws_init, _sim_pc_per_cam, env_unwrapped.scene.env_origins)
+            _last_pc1 = pc1_init
+            pc_fused_init[:, :_sim_pc_per_cam] = pc1_init   # cam1 30cm follow
+            if args.disable_cam2:
+                _last_pc2 = None
+            else:
+                _ws_init_cam2 = raise_z_floor(_ws_init, getattr(_PERC, "wrist_cam_z_floor", None))
+                pc2_init, _, _ = camera_pc(cam2, _ws_init_cam2, _sim_pc_per_cam, env_unwrapped.scene.env_origins,
+                                           pose_w=_cam2_pose())
+                _last_pc2 = pc2_init
+                pc_fused_init[:, _sim_pc_per_cam:] = pc2_init   # cam2 30cm follow (same frame, different view)
         _initial_pc = append_robot_drill(pc_fused_init)
 
-        # ---------- Load DP3 ----------
         from diffusion_policy_3d.policy.dp3 import DP3
         import dill
         from hydra.utils import instantiate as hydra_instantiate
         from omegaconf import OmegaConf
         OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-        print(f"\nLoading DP3 checkpoint: {args.dp3_ckpt}", flush=True)
         payload = torch.load(args.dp3_ckpt, pickle_module=dill, map_location="cpu")
         dp3_cfg = payload["cfg"]
 
-        # agent_pos 维度从 checkpoint 自适应:13(仅位置)或 26(位置+接触力)。
-        # 自动判定,collect 用 --force_state 训出来的就走 force 模式,无需手动对齐。
         from perception.student_obs import build_agent_pos
         _agent_dim = None
         for _path in (lambda: dp3_cfg.task.shape_meta.obs.agent_pos.shape[0],
@@ -505,6 +1403,116 @@ def main():
         with_force = _agent_dim > 13
         print(f"  agent_pos dim = {_agent_dim} (force_state={with_force})", flush=True)
 
+        _ckpt_pc = None
+        for _path in (lambda: dp3_cfg.task.shape_meta.obs.point_cloud.shape[0],
+                      lambda: dp3_cfg.shape_meta.obs.point_cloud.shape[0]):
+            try:
+                _ckpt_pc = int(_path()); break
+            except Exception:
+                continue
+        if _ckpt_pc is not None and _ckpt_pc != total_pc:
+            raise RuntimeError(
+                f"check that --chained/--pc_num_points/--plate_pc_points/--robot_pc_points/"
+                f"--drill_mesh_points match the collection")
+        print(f"  point_cloud: ckpt={_ckpt_pc} deploy={total_pc} ✓", flush=True)
+
+        # point cloud channels: ckpt shape[-1]==4 -> 4 channels (xyz+mask), compute GT handle mask live in sim
+        _ckpt_ch = None
+        for _path in (lambda: dp3_cfg.task.shape_meta.obs.point_cloud.shape[-1],
+                      lambda: dp3_cfg.shape_meta.obs.point_cloud.shape[-1]):
+            try:
+                _ckpt_ch = int(_path()); break
+            except Exception:
+                continue
+        if _ckpt_ch is None:
+            _ckpt_ch = 3
+        with_mask = (_ckpt_ch == 4)
+        print(f"  point_cloud channels = {_ckpt_ch} "
+              f"({'xyz+mask(GT handle)' if with_mask else 'xyz'})", flush=True)
+        if with_mask:
+            # printed loudly because a threshold mismatch with the collection run is silent otherwise:
+            # the channel is still 0/1, just labelled by a different radius than the policy was trained on
+            print(f"[MASK] 4th channel = GT is_handle, threshold={args.mask_threshold}m, applied to "
+                  f"the camera segment [0,{args.pc_num_points}) only (robot/plate/ground = 0). "
+                  f"This MUST match collect_dp3_data.py --mask_threshold for this checkpoint's data.",
+                  flush=True)
+            _initial_pc = add_mask_channel(_initial_pc)   # add the 4th channel to the initial obs history too
+
+        # ---- --dump_obs_zarr: record the DEPLOYED observation stream in collect's exact layout ----
+        # Purpose: diff "what the policy sees at deploy" against "what it was trained on", byte for
+        # byte. Mirrors collect_dp3_data.py exactly: same row pairing (obs at decision time + the q*
+        # executed that step), same bad-frame skipping, point_cloud stored as xyz with the mask split
+        # back out into its own pc_mask array, same float16 point cloud.
+        _dump = None
+        if args.dump_obs_zarr:
+            import shutil
+            import zarr as _zarr
+            from numcodecs import Blosc as _Blosc
+            _dpath = args.dump_obs_zarr
+            if os.path.exists(_dpath):
+                shutil.rmtree(_dpath)
+            # zarr_format=2 like collect: zarr v3's native codecs reject numcodecs.Blosc and don't
+            # resize incrementally, and the dump must be readable by the same tools as a collect zarr
+            _droot = _zarr.group(_dpath, zarr_format=2)
+            _dd = _droot.create_group("data")
+            _dm = _droot.create_group("meta")
+            _cmp = _Blosc(cname="zstd", clevel=3, shuffle=1)
+            _dd.create_dataset("point_cloud", shape=(0, total_pc, 3), dtype="float16",
+                               chunks=(64, total_pc, 3), compressor=_cmp, overwrite=True)
+            _dd.create_dataset("state", shape=(0, _agent_dim), dtype="float32",
+                               chunks=(1024, _agent_dim), compressor=_cmp, overwrite=True)
+            _dd.create_dataset("action", shape=(0, 13), dtype="float32",
+                               chunks=(1024, 13), compressor=_cmp, overwrite=True)
+            if with_mask:
+                _dd.create_dataset("pc_mask", shape=(0, total_pc), dtype="uint8",
+                                   chunks=(64, total_pc), compressor=_cmp, overwrite=True)
+            _dm.create_dataset("episode_ends", shape=(0,), dtype="int64",
+                               chunks=(64,), compressor=_cmp, overwrite=True)
+            _dump = dict(root=_droot, data=_dd, meta=_dm, env=int(args.dump_obs_env),
+                         want=int(args.dump_obs_episodes), done=0, rows=[], ends=[],
+                         prev_pc=None, prev_state=None, prev_bad=False, skipped=0)
+            print(f"[DUMP] recording env {_dump['env']}'s first {_dump['want']} episode(s) -> "
+                  f"{_dpath} | point_cloud({total_pc},3) float16"
+                  f"{' + pc_mask' if with_mask else ''} + state({_agent_dim}) + action(13), "
+                  f"collect's layout & timing", flush=True)
+
+        def _dump_row(action_row):
+            """Called right before env.step(): pair the previous post-step observation (= what the
+            policy saw when it decided) with the q* about to be executed, exactly like collect's 1c."""
+            if _dump is None or _dump["done"] >= _dump["want"] or _dump["prev_pc"] is None:
+                return
+            if _dump["prev_bad"]:            # collect drops empty-camera frames; do the same
+                _dump["skipped"] += 1
+                return
+            _dump["rows"].append((_dump["prev_state"], action_row, _dump["prev_pc"]))
+
+        def _dump_flush():
+            """Episode finished for the recorded env -> append it to the zarr."""
+            if _dump is None or not _dump["rows"]:
+                return
+            st, ac, pc = zip(*_dump["rows"])
+            n = len(st)
+            pc_arr = np.stack(pc)                                   # (n, total_pc, 3 or 4)
+            xyz = pc_arr[..., :3].astype(np.float16)
+            base = _dump["data"]["point_cloud"].shape[0]
+            _dump["data"]["point_cloud"].resize((base + n, total_pc, 3))
+            _dump["data"]["point_cloud"][base:base + n] = xyz
+            _dump["data"]["state"].resize((base + n, _agent_dim))
+            _dump["data"]["state"][base:base + n] = np.stack(st).astype(np.float32)
+            _dump["data"]["action"].resize((base + n, 13))
+            _dump["data"]["action"][base:base + n] = np.stack(ac).astype(np.float32)
+            if with_mask:
+                _dump["data"]["pc_mask"].resize((base + n, total_pc))
+                _dump["data"]["pc_mask"][base:base + n] = (pc_arr[..., 3] > 0.5).astype(np.uint8)
+            _dump["ends"].append(base + n)
+            _dump["meta"]["episode_ends"].resize((len(_dump["ends"]),))
+            _dump["meta"]["episode_ends"][:] = np.array(_dump["ends"], dtype=np.int64)
+            _dump["done"] += 1
+            _dump["rows"] = []
+            print(f"[DUMP] episode {_dump['done']}/{_dump['want']} written: {n} frames "
+                  f"(skipped {_dump['skipped']} empty-camera frames) -> {args.dump_obs_zarr}",
+                  flush=True)
+
         dp3_policy: DP3 = hydra_instantiate(dp3_cfg.policy)
         dp3_policy.to(args.device)
         dp3_policy.eval()
@@ -512,9 +1520,7 @@ def main():
 
         if args.num_inference_steps is not None:
             dp3_policy.num_inference_steps = args.num_inference_steps
-            print(f"  Override num_inference_steps -> {args.num_inference_steps}")
 
-        # 优先使用 EMA 权重
         if "ema_model" in payload["state_dicts"]:
             dp3_policy_ema: DP3 = hydra_instantiate(dp3_cfg.policy)
             dp3_policy_ema.to(args.device)
@@ -522,7 +1528,6 @@ def main():
             if args.num_inference_steps is not None:
                 dp3_policy_ema.num_inference_steps = args.num_inference_steps
             dp3_policy_ema.eval()
-            print("  Using EMA model.")
         else:
             dp3_policy_ema = dp3_policy
 
@@ -547,32 +1552,42 @@ def main():
                 dp3_policy_ema.normalizer.to(args.device)
             print("  Loaded normalizer from checkpoint pickles.")
         else:
-            if not args.data_path:
-                raise RuntimeError(
-                    "Checkpoint 无内嵌 normalizer 且未提供 --data_path,无法构建 normalizer。")
-            normalizer = compute_normalizer_from_zarr(args.data_path, args.device)
-            dp3_policy.set_normalizer(normalizer)
-            dp3_policy.normalizer.to(args.device)
-            if _has_ema:
-                dp3_policy_ema.set_normalizer(normalizer)
-                dp3_policy_ema.normalizer.to(args.device)
-            print("  Computed normalizer from dataset (fallback, used --data_path).")
+            raise RuntimeError("Checkpoint has no embedded normalizer, cannot deploy (check that training saved correctly).")
 
         n_obs = dp3_policy.n_obs_steps          # 2
-        n_act = dp3_policy.n_action_steps       # 从 ckpt 读(训练用 4)
+        n_act = dp3_policy.n_action_steps       # read from ckpt (training used 4)
         exec_n = n_act if args.exec_horizon is None else max(1, min(args.exec_horizon, n_act))
         horizon = dp3_policy.horizon           # 16
+        if args.lag_comp < 0 or n_obs - 1 + args.lag_comp + n_act > horizon:
+            raise ValueError(f"lag_comp={args.lag_comp} invalid: need 0 <= lag_comp and "
+                             f"(To-1)+lag_comp+n_act <= horizon "
+                             f"({n_obs - 1}+{args.lag_comp}+{n_act} > {horizon})")
         num_inf_steps = args.num_inference_steps or dp3_policy.num_inference_steps
-        policy_pc_points = total_pc  # camera + robot + drill(按 --pc_mode),须与训练数据一致
-        sim_pc_per_cam = args.pc_num_points // 2  # 每相机 1024(cam1 跟随 + cam2 工作区)
+        sim_pc_per_cam = args.pc_num_points if args.disable_cam2 else args.pc_num_points // 2
 
-        print(f"\n  DP3 config: horizon={horizon}, n_obs={n_obs}, n_act={n_act}")
+        print(f"\n  DP3 config: horizon={horizon}, n_obs={n_obs}, n_act={n_act}, "
+              f"lag_comp={args.lag_comp} (execution slot from {n_obs - 1 + args.lag_comp};"
+              f"0=new-gen official-timing ckpt, 1=old-gen action-shifted ckpt)")
         print(f"  inference steps={num_inf_steps}")
 
-        from perception.target_drive import install_direct_drive
-        install_direct_drive(env_unwrapped)
+        from perception.target_drive import install_direct_drive, raw_to_target
+        # main single-checkpoint DP3 path (and dual mode's teacher-q* reference)
+        _drive_p = install_direct_drive(env_unwrapped, rate_limit=args.rate_limit)
 
-        # ---------- State helpers ----------
+        if args.timeout_only:
+            _orig_get_dones = env_unwrapped._get_dones
+
+            def _get_dones_timeout_only():
+                # still call the original _get_dones to update the success cache. Keep only NaN in the termination condition (diverged envs must be recycled,
+                # else bad poses spam USD warnings each frame and pollute stats), all others (success/drop/limit) do not terminate, run to timeout.
+                terminated, truncated = _orig_get_dones()
+                nan_mask = getattr(env_unwrapped, "_pending_nan_mask", None)
+                term = (nan_mask.clone() if nan_mask is not None
+                        else torch.zeros_like(terminated))
+                return term, truncated
+
+            env_unwrapped._get_dones = _get_dones_timeout_only
+
         controlled_indices = env_unwrapped.controlled_joint_indices.cpu()
         workspace = tuple(args.workspace)
         env_origins = env_unwrapped.scene.env_origins
@@ -582,28 +1597,17 @@ def main():
         env_episode_rewards = torch.zeros(args.num_envs, device=args.device)
         total_episodes = 0
         successful_episodes = 0
+        grasp_successful_episodes = 0          # >=1 step check_success (main criterion)
+        ever_grasp = np.zeros(args.num_envs, dtype=bool)   # whether this episode has had at least 1 grasp-success step
+        stable_grasp_episodes = 0              # stable grasp entering stage2 (20/50 criterion)
+        grasp_switch_steps = []      
         success_log = []
         episode_rewards = []
         total_zero_pc = 0
         total_steps = 0
-        _zpc_dbg_count = 0   # 一次性诊断:已打印的 zero_pc 成因条数(封顶后不再刷屏)
 
-        # ---------- 轨迹保存（可选）----------
-        traj_buffers = [[] for _ in range(args.num_envs)] if args.save_traj else None
-        env_started = np.zeros(args.num_envs, dtype=bool)
 
-        # ---------- 部署采集(DP3 开车录 zarr,schema 同 collect_dp3_data.py)----------
-        collect_mode = args.collect
-        collector = (DeployCollector(args.collect_output, args.num_envs, total_pc,
-                                     args.collect_filter, state_dim=_agent_dim)
-                     if collect_mode else None)
-        if collect_mode:
-            print(f"[COLLECT] ON -> {args.collect_output} | target={args.collect_episodes} eps "
-                  f"| filter={args.collect_filter} | drive=direct-target "
-                  f"| state_dim={_agent_dim} | total_pc={total_pc}", flush=True)
-
-        # ---------- 预填充每个 env 的观测历史 ----------
-        initial_state = build_agent_pos(env_unwrapped, with_force)   # 13 或 26 维 agent_pos
+        initial_state = build_agent_pos(env_unwrapped, with_force)   # 13 or 26 dim agent_pos
         for env_id in range(args.num_envs):
             for _ in range(n_obs):
                 env_obs_histories[env_id].append({
@@ -615,7 +1619,6 @@ def main():
         pending_idx = [0] * args.num_envs
 
 
-        # ---- 分段性能计时（诊断瓶颈用）----
         _prof = {"infer": 0.0, "step": 0.0, "render": 0.0, "pc": 0.0}
         _prof_infer_calls = 0
         _last_print_step = 0
@@ -624,26 +1627,153 @@ def main():
             if _use_cuda:
                 torch.cuda.synchronize(args.device)
 
+        def _run_dual():
+            """Co-trajectory dual inference: each step runs DP3 (shadow, replans every step) and the RL teacher on the same observation,
+            the driver actually drives (env follows its trajectory), printing the per-step q* action difference (rad->deg), optionally saved to disk.
+            driver=rl: env follows the success trajectory, diff=student's deviation on the good trajectory (cleanest diagnostic).
+            driver=dp3: env follows the student trajectory, diff=how the teacher would correct at the state the student drifted to."""
+            nonlocal _last_pc1, _last_pc2
+            mode, agent1, agent2, d1, d2 = _build_teachers(env_unwrapped, args)
+            _cs = n_obs - 1 + args.lag_comp
+            obs_priv = env_unwrapped._get_observations()["policy"]
+            if mode == "chained":
+                agent1.get_batch_size(obs_priv[:, :d1], 1); agent1.reset()
+                agent2.get_batch_size(obs_priv, 1); agent2.reset()
+            else:
+                agent1.get_batch_size(obs_priv, 1); agent1.reset()
+
+            _deg = 57.29578
+            _steps = 0; _eps = 0
+            _tr_phase, _tr_dp3, _tr_tea, _tr_diff = [], [], [], []
+            print(f"\n[DUAL] co-trajectory dual inference: driver={args.driver} "
+                  f"({'teacher drives, measure student deviation' if args.driver=='rl' else 'DP3 drives, measure teacher correction'})"
+                  f" | per-step: |dq*| arm/finger mean|max (deg)", flush=True)
+            sys.stdout.flush()
+
+            with torch.inference_mode():
+                while simulation_app.is_running() and _eps < args.num_episodes:
+                    # DP3 shadow: replan each step with the current history, take the current step's action q*
+                    obs_batch_list, pc_batch_list = [], []
+                    for env_id in range(args.num_envs):
+                        hist = list(env_obs_histories[env_id])
+                        if len(hist) < n_obs:
+                            hist = [hist[0]] * (n_obs - len(hist)) + hist
+                        obs_ts = hist[-n_obs:]
+                        obs_batch_list.append(torch.stack([s["agent_pos"] for s in obs_ts]))
+                        pc_batch_list.append(torch.stack([s["point_cloud"] for s in obs_ts]))
+                    obs_dict = {"agent_pos": torch.stack(obs_batch_list),
+                                "point_cloud": torch.stack(pc_batch_list)}
+                    dp3_q = dp3_policy_ema.predict_action(obs_dict)["action_pred"][:, _cs]  # (B,13) q*
+
+                    # teacher inference -> q* (same obs_priv, raw->target same as collect)
+                    traw = _teacher_raw_action(mode, agent1, agent2, d1, obs_priv,
+                                               env_unwrapped, args.device)
+                    cur0 = env_unwrapped.cur_targets.clone()
+                    teacher_q = raw_to_target(traw, cur0, _drive_p)
+
+                    diff = dp3_q - teacher_q                          # (B,13) rad, same scale so direct subtraction
+                    _drive = teacher_q if args.driver == "rl" else dp3_q
+                    env_unwrapped._direct_target = _drive
+                    obs_dict_step, rewards, terminated, truncated, _ = env_unwrapped.step(_drive)
+                    obs_priv = obs_dict_step["policy"]
+                    _steps += 1
+
+                    _ad = diff[:, :7].abs(); _fd = diff[:, 7:].abs()
+                    _ph = int((env_unwrapped.phase == 1).sum().item()) if args.chained else 0
+                    print(f"  step={_steps:4d} s2={_ph}/{args.num_envs} | "
+                          f"arm |Δ| mean={_ad.mean().item()*_deg:5.2f} max={_ad.max().item()*_deg:6.2f} | "
+                          f"finger |Δ| mean={_fd.mean().item()*_deg:5.2f} max={_fd.max().item()*_deg:6.2f}",
+                          flush=True)
+                    if args.dual_trace:
+                        _tr_phase.append(env_unwrapped.phase.detach().cpu().numpy().copy())
+                        _tr_dp3.append(dp3_q.detach().cpu().numpy())
+                        _tr_tea.append(teacher_q.detach().cpu().numpy())
+                        _tr_diff.append(diff.detach().cpu().numpy())
+
+                    # update DP3 obs history (post-step, byte-for-byte same as the main loop)
+                    cam1.update(dt); cam2.update(dt)
+                    if cam3 is not None:
+                        cam3.update(dt)
+                    state_now = build_agent_pos(env_unwrapped, with_force)
+                    _ws = camera_crop_bounds(env_unwrapped.drill.data.root_pos_w,
+                                             env_origins, _PERC, workspace)
+                    pc1_t, zmask1, _ = camera_pc(cam1, _ws, sim_pc_per_cam, env_origins)
+                    if not args.disable_cam2:
+                        _ws_cam2 = raise_z_floor(_ws, getattr(_PERC, "wrist_cam_z_floor", None))
+                        pc2_t, zmask2, _ = camera_pc(cam2, _ws_cam2, sim_pc_per_cam, env_origins,
+                                                     pose_w=_cam2_pose())
+                    if not args.chained:
+                        pc1_t = torch.where(zmask1.view(-1, 1, 1), _last_pc1, pc1_t)
+                        _last_pc1 = pc1_t
+                        if not args.disable_cam2:
+                            pc2_t = torch.where(zmask2.view(-1, 1, 1), _last_pc2, pc2_t)
+                            _last_pc2 = pc2_t
+                    pcf = torch.zeros(args.num_envs, args.pc_num_points, 3,
+                                     device=args.device, dtype=torch.float32)
+                    pcf[:, :sim_pc_per_cam] = pc1_t
+                    if not args.disable_cam2:
+                        pcf[:, sim_pc_per_cam:] = pc2_t
+                    pc_now = add_mask_channel(append_robot_drill(pcf))
+
+                    is_done = terminated.bool() | truncated.bool()
+                    if is_done.any():
+                        _eps += int(is_done.sum().item())
+                        agent1.reset()
+                        if mode == "chained":
+                            agent2.reset()
+                        reset_state = build_agent_pos(env_unwrapped, with_force)
+                        for env_idx in torch.where(is_done)[0]:
+                            e = env_idx.item()
+                            env_obs_histories[e].clear()
+                            for _ in range(n_obs):
+                                env_obs_histories[e].append(
+                                    {"agent_pos": reset_state[e], "point_cloud": pc_now[e]})
+                    for env_id in range(args.num_envs):
+                        if not is_done[env_id]:
+                            env_obs_histories[env_id].append(
+                                {"agent_pos": state_now[env_id], "point_cloud": pc_now[env_id]})
+
+            if args.dual_trace and _tr_diff:
+                np.savez(args.dual_trace, phase=np.stack(_tr_phase), dp3_q=np.stack(_tr_dp3),
+                         teacher_q=np.stack(_tr_tea), diff=np.stack(_tr_diff))
+                print(f"[DUAL] trace -> {args.dual_trace} ({len(_tr_diff)} steps, "
+                      f"shape/step=({args.num_envs},13))", flush=True)
+            _all = np.concatenate([d.reshape(-1, 13) for d in _tr_diff], 0) if _tr_diff else None
+            if _all is not None:
+                print(f"[DUAL] overall mean |dq*|: arm={np.abs(_all[:, :7]).mean()*_deg:.2f}deg "
+                      f"finger={np.abs(_all[:, 7:]).mean()*_deg:.2f}deg over {_steps} steps", flush=True)
+
+        if args.dual:
+            _run_dual()
+            return
+
         start_time = time.time()
-        print(f"\nStarting DP3 rollout (target {args.num_episodes} episodes, "
+        _target_desc = (f"{_exam_total} exam poses (sequential, fixed from init_pose_file)"
+                        if _exam_res is not None else f"{args.num_episodes} episodes")
+        print(f"\nStarting DP3 rollout (target {_target_desc}, "
               f"{args.num_envs} envs)...")
         print(f"  workspace(env-local)={workspace}")
-        print(f"  obs: agent_pos[{_agent_dim}] + point_cloud[{policy_pc_points},3]")
+        print(f"  obs: agent_pos[{_agent_dim}] + point_cloud[{total_pc},{_ckpt_ch}]"
+              f"{' (4th channel=GT handle mask)' if with_mask else ''}")
+        if args.chained:
+            print(f"  eval: chained={args.chained} stage1_only={args.stage1_only} "
+                  f"(must match collect, else the success criterion mismatches the training data)")
+        if args.stage2_only:
+            print(f"  eval: stage2_only=True, camera segment=cam2+cam3 ({args.pc_num_points} points, "
+                  f"{args.pc_num_points//2} each), drill starts already grasped (must match collect, "
+                  f"else the success criterion mismatches the training data)")
         sys.stdout.flush()
 
         try:
             with torch.inference_mode():
                 while simulation_app.is_running() and (
-                        (collector.collected < args.collect_episodes) if collect_mode
-                        else (total_episodes < args.num_episodes)):
+                        _exam_pending() if _exam_res is not None else total_episodes < args.num_episodes):
                     try:
-                        # ---- 1) 哪些 env 需要新的 action chunk ----
                         need_policy_call = [
                             env_id for env_id in range(args.num_envs)
                             if pending_actions[env_id] is None or pending_idx[env_id] >= exec_n
                         ]
 
-                        # ---- 2) DP3 推理（批处理）----
                         if need_policy_call:
                             _sync(); _t0 = time.perf_counter()
                             obs_batch_list, pc_batch_list = [], []
@@ -660,7 +1790,8 @@ def main():
                                 "point_cloud": torch.stack(pc_batch_list),      # (B, n_obs, P, 3) GPU
                             }
                             result = dp3_policy_ema.predict_action(obs_dict)
-                            action_chunks = result["action"]                    # (B, n_act, 13) GPU
+                            _cs = n_obs - 1 + args.lag_comp
+                            action_chunks = result["action_pred"][:, _cs:_cs + n_act]  # (B, n_act, 13) GPU
 
                             for i, env_id in enumerate(need_policy_call):
                                 pending_actions[env_id] = action_chunks[i]
@@ -668,8 +1799,6 @@ def main():
                             _sync(); _prof["infer"] += time.perf_counter() - _t0
                             _prof_infer_calls += 1
 
-                        # ---- 3) 执行一帧动作 ----
-                        # actions_policy: policy 直接输出（target 模式下即关节目标角 rad），全程留在 GPU
                         actions_policy = torch.zeros((args.num_envs, 13),
                                                      device=args.device, dtype=torch.float32)
                         for env_id in range(args.num_envs):
@@ -677,111 +1806,88 @@ def main():
                                 actions_policy[env_id] = pending_actions[env_id][pending_idx[env_id]]
                                 pending_idx[env_id] += 1
 
-                        # DP3 的关节目标角 q* 直接下发(patched _apply_action 用 _direct_target);
-                        # actions 仅作占位传给 step(被 patched _apply_action 忽略)。
+                        if _exam_res is not None and _frozen.any():
+                            # frozen envs (their variant's exam is done): hold current joint targets
+                            # instead of the policy's action, so they just sit still (never reset,
+                            # via _get_dones_freeze_exhausted above -> never draw a new pose either).
+                            actions_policy[_frozen] = env_unwrapped.cur_targets[_frozen]
+
                         env_unwrapped._direct_target = actions_policy
                         actions = actions_policy
+                        # collect's 1c timing: pair the obs the policy just decided on with this q*
+                        if _dump is not None:
+                            _dump_row(actions_policy[_dump["env"]].detach().cpu().numpy())
                         _sync(); _t0 = time.perf_counter()
                         obs_dict_step, rewards, terminated, truncated, _ = env_unwrapped.step(actions)
                         _sync(); _prof["step"] += time.perf_counter() - _t0
                         total_steps += 1
 
-                        # ---- 4) 更新相机：在 step() 之后（与 collect_dp3_data.py 一致）----
+
                         _sync(); _t0 = time.perf_counter()
                         cam1.update(dt)
                         cam2.update(dt)
+                        if cam3 is not None:
+                            cam3.update(dt)
                         _sync(); _prof["render"] += time.perf_counter() - _t0
 
-                        # ---- 5) 在 step() 之后读取 agent_pos（与 collect_dp3_data.py 同一真源）----
-                        state_13 = build_agent_pos(env_unwrapped, with_force)   # 13 或 26 维
-
-                        # ---- 6) 深度图 -> 点云(单一真源 camera_crop_bounds + camera_pc;
-                        #         裁剪框由 _PERC.camera_follow_drill 决定,当前=固定 workspace)----
+                        state_13 = build_agent_pos(env_unwrapped, with_force)   # 13 or 26 dims
                         _sync(); _t0 = time.perf_counter()
                         _ws = camera_crop_bounds(env_unwrapped.drill.data.root_pos_w,
                                                  env_origins, _PERC, workspace)
-                        pc1_t, zmask1, depth1 = camera_pc(cam1, _ws, sim_pc_per_cam, env_origins)
-                        pc2_t, zmask2, _ = camera_pc(cam2, _ws, sim_pc_per_cam, env_origins)
-                        total_zero_pc += int(zmask1.sum().item() + zmask2.sum().item())
-
-                        # ---- 一次性诊断:zero_pc 究竟为什么空(最多打 30 条)----
-                        # valid_depth_px≈0 -> 相机本帧深度整张是空的(渲染滞后/没渲染);
-                        # valid_depth_px 很大但仍空 -> 框对不上(电钻真值位姿 vs 深度不同帧,
-                        #   或电钻被移出相机视野)。reset_this_step 区分是不是 reset 瞬态。
-                        if zmask1.any() and _zpc_dbg_count < 30:
-                            _done_now = terminated.bool() | truncated.bool()
-                            _dpos = (env_unwrapped.drill.data.root_pos_w - env_origins)  # (B,3) env-local
-                            # 反投影(不裁剪)cam1 的全部有效点,看它们落在哪
-                            _pl1, _vmsk1 = depth_to_pointcloud_batch(
-                                depth1, cam1.data.intrinsic_matrices, cam1.data.pos_w,
-                                cam1.data.quat_w_ros, _ws, sim_pc_per_cam, env_origins, diag_only=True)
-                            def _bbox(pl, vm, e):
-                                p = pl[e][vm[e]]
-                                if p.numel() == 0:
-                                    return "EMPTY"
-                                lo = p.min(0).values; hi = p.max(0).values
-                                return (f"x[{lo[0]:.2f},{hi[0]:.2f}] y[{lo[1]:.2f},{hi[1]:.2f}] "
-                                        f"z[{lo[2]:.2f},{hi[2]:.2f}] n={p.shape[0]}")
-                            for _e in range(args.num_envs):
-                                if zmask1[_e] and _zpc_dbg_count < 30:
-                                    _cp1 = cam1.data.pos_w[_e] - env_origins[_e]
-                                    print(f"[ZPC] step={total_steps} env={_e} cam1_empty "
-                                          f"reset={bool(_done_now[_e])} "
-                                          f"drill(env-local)=[{_dpos[_e,0]:.2f},{_dpos[_e,1]:.2f},{_dpos[_e,2]:.2f}]",
-                                          flush=True)
-                                    print(f"       cam1@[{_cp1[0]:.2f},{_cp1[1]:.2f},{_cp1[2]:.2f}] pts {_bbox(_pl1,_vmsk1,_e)}", flush=True)
-                                    _zpc_dbg_count += 1
-
-                        # collect 采数据时跳过相机空帧(bad_pc),训练数据里没有全 0 的点云。
-                        # 部署不能跳帧,改为沿用 cam1 上一帧的有效云(等价于"本帧无新信息"),
-                        # 避免喂 0 这种严重 off-manifold 输入。空帧多发生在 reset 后渲染滞后,
-                        # 或电钻被手遮挡的帧;下一帧拿到新云即自动纠正。
-                        pc1_t = torch.where(zmask1.view(-1, 1, 1), _last_pc1, pc1_t)
-                        pc2_t = torch.where(zmask2.view(-1, 1, 1), _last_pc2, pc2_t)
-                        _last_pc1 = pc1_t
-                        _last_pc2 = pc2_t
-
                         pc_fused_2048 = torch.zeros(args.num_envs, args.pc_num_points, 3,
                                                    device=args.device, dtype=torch.float32)
-                        pc_fused_2048[:, :sim_pc_per_cam] = pc1_t   # cam1 30cm 跟随
-                        pc_fused_2048[:, sim_pc_per_cam:] = pc2_t   # cam2 30cm 跟随(同框,异视角)
+                        if args.stage2_only:
+                            # camera segment = cam2 (wrist) + cam3 (plate), cam1 not sampled (same
+                            # convention as collect_dp3_data.py --stage2_only).
+                            _ws_cam2 = raise_z_floor(_ws, getattr(_PERC, "wrist_cam_z_floor", None))
+                            pc2_t, zmask2, _ = camera_pc(cam2, _ws_cam2, sim_pc_per_cam, env_origins,
+                                                         pose_w=_cam2_pose())
+                            pc3_t, zmask3, _ = camera_pc(cam3, _ws, sim_pc_per_cam, env_origins)
+                            total_zero_pc += int(zmask2.sum().item() + zmask3.sum().item())
 
-                        # 相机云(pc_num_points)后追加 FK机器人/电钻云 -> 与训练数据同布局
-                        pc_for_policy = append_robot_drill(pc_fused_2048)
+                            # reuse-last-good-frame substitution: stage2_only is never `chained`
+                            # (mutually exclusive), so this always applies here, matching collect's
+                            # convention (only chained/stage1_only skip it).
+                            pc2_t = torch.where(zmask2.view(-1, 1, 1), _last_pc2, pc2_t)
+                            _last_pc2 = pc2_t
+                            pc3_t = torch.where(zmask3.view(-1, 1, 1), _last_pc3_stage2, pc3_t)
+                            _last_pc3_stage2 = pc3_t
+
+                            pc_fused_2048[:, :sim_pc_per_cam] = pc2_t
+                            pc_fused_2048[:, sim_pc_per_cam:] = pc3_t
+                        else:
+                            pc1_t, zmask1, _ = camera_pc(cam1, _ws, sim_pc_per_cam, env_origins)
+                            if not args.disable_cam2:
+                                _ws_cam2 = raise_z_floor(_ws, getattr(_PERC, "wrist_cam_z_floor", None))
+                                pc2_t, zmask2, _ = camera_pc(cam2, _ws_cam2, sim_pc_per_cam, env_origins,
+                                                             pose_w=_cam2_pose())
+                                total_zero_pc += int(zmask1.sum().item() + zmask2.sum().item())
+                            else:
+                                total_zero_pc += int(zmask1.sum().item())
+
+                            if not args.chained:
+                                pc1_t = torch.where(zmask1.view(-1, 1, 1), _last_pc1, pc1_t)
+                                _last_pc1 = pc1_t
+                                if not args.disable_cam2:
+                                    pc2_t = torch.where(zmask2.view(-1, 1, 1), _last_pc2, pc2_t)
+                                    _last_pc2 = pc2_t
+
+                            pc_fused_2048[:, :sim_pc_per_cam] = pc1_t   # cam1 30cm follow
+                            if not args.disable_cam2:
+                                pc_fused_2048[:, sim_pc_per_cam:] = pc2_t   # cam2 30cm follow (same frame, different view)
+
+                        pc_for_policy = add_mask_channel(append_robot_drill(pc_fused_2048))
+                        # empty-camera mask, same composition rule collect uses to drop a frame
+                        # (stage2_only: cam2|cam3; disable_cam2: cam1 alone; else cam1|cam2)
+                        if _dump is not None:
+                            _l = locals()
+                            if args.stage2_only:
+                                _bad_now = _l["zmask2"] | _l["zmask3"]
+                            elif args.disable_cam2:
+                                _bad_now = _l["zmask1"]
+                            else:
+                                _bad_now = _l["zmask1"] | _l["zmask2"]
                         _sync(); _prof["pc"] += time.perf_counter() - _t0
-
-                        # ---- 一次性 OBS 自检:对比 deploy 观测 range 与训练 zarr ----
-                        # 训练数据(collect)范围参考(state 只剩 13 关节位置):
-                        #   state pos[-2.84,3.19]
-                        #   camera x[0.00,1.51] y[-0.60,0.94] z[0.02,0.78]
-                        #   robot  x[-0.15,1.03] y[-0.34,0.56] z[-0.00,0.74]
-                        #   drill  x[0.40,1.10] y[-0.26,0.58] z[0.02,0.78]
-                        if total_steps == 1:
-                            _s = state_13[0].detach().cpu().numpy()
-                            _p = pc_for_policy[0].detach().cpu().numpy()
-                            _nc = args.pc_num_points
-                            print(f"[OBS-CHECK] pc.shape={tuple(pc_for_policy.shape)} | "
-                                  f"state pos[{_s.min():.2f},{_s.max():.2f}]", flush=True)
-                            def _bb(name, q):
-                                print(f"  {name}: x[{q[:,0].min():.2f},{q[:,0].max():.2f}] "
-                                      f"y[{q[:,1].min():.2f},{q[:,1].max():.2f}] "
-                                      f"z[{q[:,2].min():.2f},{q[:,2].max():.2f}]", flush=True)
-                            _bb("camera", _p[:_nc])
-                            if robot_pc_M:
-                                _bb("robot ", _p[_nc:_nc + robot_pc_M])
-                            if drill_M:
-                                _bb("drill ", _p[_nc + robot_pc_M:_nc + robot_pc_M + drill_M])
-                            _bb("ground", _p[_nc + robot_pc_M + drill_M:])
-                            # 重叠自检:相机段每帧唯一点数。<pc_num_points 即有重复点
-                            # (有效像素 < pool_size 时,缺口用 first_valid 重复填充)。
-                            _cam = pc_for_policy[:, :_nc, :]
-                            _uniq = torch.tensor([torch.unique(_cam[b], dim=0).shape[0]
-                                                  for b in range(_cam.shape[0])])
-                            _vpx = (depth1[..., 0] > 0).flatten(1).sum(dim=1)  # cam1 总有效像素(裁剪前)
-                            print(f"  [DUP-CHECK] camera unique/frame: min={int(_uniq.min())} "
-                                  f"mean={float(_uniq.float().mean()):.0f} max={int(_uniq.max())} of {_nc} "
-                                  f"| cam1 valid_px(裁剪前) min={int(_vpx.min())} mean={int(_vpx.float().mean())} "
-                                  f"| pool_size=2048 -> unique<{_nc} 即有重复点", flush=True)
 
                         env_episode_rewards += rewards
                         is_done = terminated.bool() | truncated.bool()
@@ -792,36 +1898,14 @@ def main():
                             lenient_success = torch.zeros(args.num_envs, dtype=torch.bool,
                                                           device=args.device)
 
-                        # ---- (采集模式) 录当前帧 + episode 边界,逻辑逐条复刻 collect_dp3_data.py ----
-                        if collect_mode:
-                            # 直接 target 驱动:动作标签 = step 后的 cur_targets(= DP3 下发的 q*)
-                            rec_act_np = env_unwrapped.cur_targets.detach().cpu().numpy()
-                            rec_state_np = state_13.detach().cpu().numpy()
-                            rec_pc_np = pc_for_policy.detach().cpu().numpy()
-                            rec_bad_np = (zmask1 | zmask2).detach().cpu().numpy()   # 相机空帧,跳过不存
-                            is_done_np = is_done.detach().cpu().numpy()
-                            succ_np = lenient_success.detach().cpu().numpy().astype(bool)
-                            # 6) 录活跃、未终止、非空帧(终止步 state/pc 已属下一局 -> 跳过)
-                            for env_id in range(args.num_envs):
-                                if (not collector.started[env_id] or is_done_np[env_id]
-                                        or rec_bad_np[env_id]):
-                                    continue
-                                collector.record_frame(env_id, rec_state_np[env_id],
-                                                        rec_act_np[env_id], rec_pc_np[env_id])
-                            # 7) episode 边界:done 即 flush(成功过滤在 flush 内),开新局
-                            for env_id in range(args.num_envs):
-                                if is_done_np[env_id]:
-                                    if collector.started[env_id]:
-                                        collector.flush(env_id, bool(succ_np[env_id]))
-                                    collector.buffers[env_id] = []
-                                    collector.started[env_id] = True
-                                elif not collector.started[env_id]:
-                                    collector.buffers[env_id] = []
-                                    collector.started[env_id] = True
+                        if args.chained:
+                            _inst = getattr(env_unwrapped, "_cached_instant_success", None)
+                            if _inst is not None:
+                                ever_grasp |= _inst.detach().cpu().numpy().astype(bool)
 
                         finished = torch.where(is_done)[0]
                         if finished.numel() > 0:
-                            reset_state = build_agent_pos(env_unwrapped, with_force)   # 13 或 26 维
+                            reset_state = build_agent_pos(env_unwrapped, with_force)   # 13 or 26 dims
 
                             for env_idx in finished:
                                 env_id = env_idx.item()
@@ -834,58 +1918,68 @@ def main():
                                 else:
                                     success_log.append(0)
 
-                                if traj_buffers is not None and len(traj_buffers[env_id]) > 0:
-                                    traj_buffers[env_id].append({
-                                        "state": state_13[env_id].cpu().numpy(),
-                                        "action": actions_policy[env_id].cpu().numpy(),
-                                        "reward": rewards[env_id].item(),
-                                        "done": True,
-                                    })
-                                    save_traj_as_npz(traj_buffers[env_id], args.save_traj, env_id)
+                                if args.chained:
+                                    if ever_grasp[env_id]:
+                                        grasp_successful_episodes += 1
+                                    ever_grasp[env_id] = False   # new episode, re-accumulate
+                                    _sw = int(env_unwrapped._last_episode_switch_step[env_id].item())
+                                    if _sw >= 0:
+                                        stable_grasp_episodes += 1
+                                        grasp_switch_steps.append(_sw)
 
                                 env_episode_rewards[env_id] = 0.0
                                 pending_actions[env_id] = None
                                 pending_idx[env_id] = 0
                                 env_obs_histories[env_id].clear()
-                                # 用刚 step 后读到的新点云重填历史，而不是冻结的 _initial_pc。
-                                # env 在 step() 内部已 auto-reset 并 rerender 3 次
-                                # (num_rerenders_on_reset=3)，所以 pc_for_policy[env_id] 已经
-                                # 反映新一局随机后的电钻位姿；reset_state==state_13（都是 step 后读的）。
                                 for _ in range(n_obs):
                                     env_obs_histories[env_id].append({
                                         "agent_pos": reset_state[env_id],
                                         "point_cloud": pc_for_policy[env_id],
                                     })
-                                env_started[env_id] = True
-                                if traj_buffers is not None:
-                                    traj_buffers[env_id] = []
 
-                        # ---- 8) 更新未结束 env 的观测历史（用 step 后读取的新 pc）----
                         for env_id in range(args.num_envs):
                             if not is_done[env_id]:
-                                if not env_started[env_id]:
-                                    env_started[env_id] = True
                                 env_obs_histories[env_id].append({
                                     "agent_pos": state_13[env_id],
                                     "point_cloud": pc_for_policy[env_id],
                                 })
-                                if traj_buffers is not None:
-                                    traj_buffers[env_id].append({
-                                        "state": state_13[env_id].cpu().numpy(),
-                                        "action": actions_policy[env_id].cpu().numpy(),
-                                        "reward": rewards[env_id].item(),
-                                        "done": False,
-                                    })
 
-                        # ---- 9) 进度打印 ----
+                        # --dump_obs_zarr bookkeeping: episode boundary first (so the finished
+                        # episode is written before prev_* is overwritten by the post-reset frame),
+                        # then cache this step's post-step observation as the next row's "obs".
+                        if _dump is not None and _dump["done"] < _dump["want"]:
+                            _e = _dump["env"]
+                            if is_done[_e]:
+                                _dump_flush()
+                            _dump["prev_pc"] = pc_for_policy[_e].detach().cpu().numpy()
+                            _dump["prev_state"] = state_13[_e].detach().cpu().numpy()
+                            # collect skips frames whose camera segment came back empty
+                            _dump["prev_bad"] = bool(_bad_now[_e].item())
+
+                        # sequential-exam mode: stop once every variant's first N poses are graded
+                        # (this is the actual stop condition -- see the while-loop guard above --
+                        # not args.num_episodes; this inner check just lets us stop mid-iteration
+                        # instead of running one extra step before the outer guard re-checks)
+                        if _exam_res is not None and not _exam_pending():
+                            print("[EXAM] all sequential init-pose items graded -> stopping", flush=True)
+                            break
+
                         if total_steps % 100 == 0:
                             elapsed = time.time() - start_time
                             sr = successful_episodes / max(total_episodes, 1) * 100
                             _win = max(total_steps - _last_print_step, 1)
                             _ms = lambda k: _prof[k] / _win * 1000.0
                             _infer_ms = _prof["infer"] / max(_prof_infer_calls, 1) * 1000.0
-                            print(f"  step={total_steps} | eps={total_episodes}/{args.num_episodes} "
-                                  f"| succ={successful_episodes} ({sr:.1f}%) "
+                            _grasp = (f"| grasp={grasp_successful_episodes} "
+                                      f"({grasp_successful_episodes / max(total_episodes, 1) * 100:.1f}%) "
+                                      f"stable={stable_grasp_episodes} "
+                                      if args.chained else "")
+                            _eps_desc = (f"{total_episodes} (exam {_exam_graded_count()}/{_exam_total}, "
+                                        f"frozen={int(_frozen.sum().item())}/{args.num_envs})"
+                                        if _exam_res is not None
+                                        else f"{total_episodes}/{args.num_episodes}")
+                            print(f"  step={total_steps} | eps={_eps_desc} "
+                                  f"| succ={successful_episodes} ({sr:.1f}%) {_grasp}"
                                   f"| zero_pc={total_zero_pc} | {total_steps/elapsed:.1f} step/s")
                             print(f"    [prof] render={_ms('render'):.1f}ms  pc+fps={_ms('pc'):.1f}ms  "
                                   f"phys={_ms('step'):.1f}ms /step | "
@@ -907,49 +2001,50 @@ def main():
             traceback.print_exc()
             raise
 
-        # ---- 最终统计 ----
         elapsed = time.time() - start_time
         m, s = divmod(int(elapsed), 60)
         h, m = divmod(m, 60)
 
-        print(f"\n{'='*60}")
-        print(f"DP3 Evaluation Results")
-        print(f"{'='*60}")
-        print(f"Checkpoint: {args.dp3_ckpt}")
-        print(f"Total episodes: {total_episodes}")
-        print(f"Successful episodes: {successful_episodes}")
         if total_episodes > 0:
             print(f"Success rate: {successful_episodes/total_episodes*100:.1f}%")
-        if collect_mode:
-            _frames = collector.data["state"].shape[0]
-            print(f"[COLLECT] saved {collector.collected} episodes / {_frames} frames "
-                  f"-> {args.collect_output} (filter={args.collect_filter})")
+        if args.chained and total_episodes > 0:
+            _gr = grasp_successful_episodes / total_episodes * 100
+            _sr2 = stable_grasp_episodes / total_episodes * 100
+            print(f"Grasp success (>=1 step check_success): {grasp_successful_episodes} ({_gr:.1f}%)")
+            print(f"Grasp stable (20/50 stable, entered stage2): {stable_grasp_episodes} ({_sr2:.1f}%)")
+            if stable_grasp_episodes > 0:
+                _ar = successful_episodes / stable_grasp_episodes * 100
+                print(f"Align success | stable (alignment rate given stable grasp): {_ar:.1f}%")
+            if grasp_switch_steps:
+                _ss = np.array(grasp_switch_steps)
+                print(f"Switch step (time to stable grasp): mean={_ss.mean():.0f} "
+                      f"median={np.median(_ss):.0f} max={_ss.max()} steps")
+        if _exam_res is not None:
+            _et = sum(len(r) for r in _exam_res.values())
+            _es = sum(int((r == 1).sum()) for r in _exam_res.values())
+            _er = sum(int((r != -1).sum()) for r in _exam_res.values())
+            print(f"\n[EXAM] sequential init-pose eval (first {_EXAM_N}/variant, each pose run once):")
+            print(f"  OVERALL success {_es}/{_er} = {_es/max(_er,1)*100:.1f}%  (exam poses total {_et})")
+            for vid in sorted(_exam_res):
+                r = _exam_res[vid]; s = int((r == 1).sum()); nn = int((r != -1).sum())
+                print(f"  variant {vid}: {s}/{nn} = {s/max(nn,1)*100:.1f}%")
         if episode_rewards:
             ep_np = np.array(episode_rewards)
             print(f"Reward: mean={ep_np.mean():.1f}, max={ep_np.max():.1f}, min={ep_np.min():.1f}, std={ep_np.std():.1f}")
-        print(f"Total steps: {total_steps}")
-        print(f"Total zero-pc frames: {total_zero_pc}")
         print(f"Time: {h}h{m}m{s}s, {total_steps/elapsed:.0f} steps/s")
         if success_log:
             print(f"Success log: {success_log}")
         print(f"{'='*60}")
 
     except Exception:
-        # 关键修复：在 finally 调用 close() 之前先把真实异常打印出来。
-        # 否则 simulation_app.close() 在 IsaacSim 的 on-stop 渲染回调里死锁时，
-        # 异常会被永久挂起、永远看不到 traceback（只表现为“卡住”）。
+        _exit_code = 1
         import traceback
-        print("\n[FATAL] Exception in main():", flush=True)
         traceback.print_exc()
         sys.stdout.flush()
         sys.stderr.flush()
     finally:
-        # 确保所有输出先落盘
         sys.stdout.flush()
         sys.stderr.flush()
-        # IsaacSim 的 simulation_app.close() 可能在 on-stop 渲染回调里死锁，
-        # 先尝试 stop timeline，再 close；最后用 os._exit 强制退出绕开死锁，
-        # 避免每次都得手动 Ctrl-C 杀进程。
         try:
             import omni.timeline
             omni.timeline.get_timeline_interface().stop()
@@ -961,17 +2056,6 @@ def main():
             pass
         os._exit(0)
 
-
-def save_traj_as_npz(buffer, output_dir, env_id):
-    """将轨迹数据保存为 npz 文件。"""
-    import os
-    os.makedirs(output_dir, exist_ok=True)
-    states = np.stack([f["state"] for f in buffer])
-    actions = np.stack([f["action"] for f in buffer])
-    rewards = np.array([f["reward"] for f in buffer])
-    path = os.path.join(output_dir, f"traj_env{env_id}.npz")
-    np.savez(path, states=states, actions=actions, rewards=rewards)
-    print(f"  Saved trajectory: {path} ({len(buffer)} steps)")
 
 
 if __name__ == "__main__":

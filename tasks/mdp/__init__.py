@@ -1,13 +1,13 @@
 """
-MDP (Markov Decision Process) 相关函数
-包含奖励、终止条件、观察等函数
+MDP (Markov Decision Process) functions.
+Rewards, terminations, observations, etc.
 """
 
-# 只导入终止条件（不需要 rewards.py）
+# Only import terminations (rewards.py not needed).
 from .terminations import *
 
 __all__ = [
-    # 终止条件
+    # terminations
     "check_success",
     "check_failure",
 ]

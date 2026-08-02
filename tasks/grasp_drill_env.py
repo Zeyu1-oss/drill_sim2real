@@ -9,8 +9,8 @@ from typing import Dict, Any, Tuple
 
 def _import_isaac_lab():
     try:
-        # 尝试新版本导入 (isaaclab)
-        from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg  # 改为 DirectRL
+        # try new-style import (isaaclab)
+        from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg  # switched to DirectRL
         from isaaclab.managers import ObservationGroupCfg as ObsGroup
         from isaaclab.managers import ObservationTermCfg as ObsTerm
         from isaaclab.managers import RewardTermCfg as RewTerm
@@ -27,12 +27,12 @@ def _import_isaac_lab():
         from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
         import isaaclab.sim as sim_utils
         import isaaclab.utils.math as math_utils
-        import isaaclab.envs.mdp as mdp  # 奖励函数需要
-        # IK 控制相关
+        import isaaclab.envs.mdp as mdp  # needed by reward functions
+        # IK control related
         from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
         from isaaclab.controllers.differential_ik import DifferentialIKController
         from isaaclab.envs.mdp.actions.actions_cfg import DifferentialInverseKinematicsActionCfg
-        # Franka 预配置
+        # Franka preconfig
         try:
             from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
             HAS_FRANKA_CFG = True
@@ -48,7 +48,7 @@ def _import_isaac_lab():
             INSPIRE_HAND_CFG = None
     except ImportError:
         try:
-            # 回退到旧版本导入 (omni.isaac.lab)
+            # fall back to old import (omni.isaac.lab)
             from omni.isaac.lab.envs import DirectRLEnv, DirectRLEnvCfg
             from omni.isaac.lab.managers import ObservationGroupCfg as ObsGroup
             from omni.isaac.lab.managers import ObservationTermCfg as ObsTerm
@@ -82,11 +82,11 @@ def _import_isaac_lab():
                 INSPIRE_HAND_CFG = None
         except ImportError as e:
             raise ImportError(
-                "无法导入Isaac Lab模块。请确保：\n"
-                "1. 已激活正确的conda环境\n"
-                "2. 使用 isaaclab.sh 脚本运行，或\n"
-                "3. 在IsaacLab目录下运行\n"
-                f"错误详情: {e}"
+                "Failed to import Isaac Lab modules. Please ensure:\n"
+                "1. the correct conda env is activated\n"
+                "2. run via the isaaclab.sh script, or\n"
+                "3. run inside the IsaacLab directory\n"
+                f"error detail: {e}"
             )
     
     return (
@@ -376,7 +376,7 @@ class GraspDrillSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(0.5, 0.5, 0.05),
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.2, 0.2, 0.2),  # 深灰色
+                diffuse_color=(0.2, 0.2, 0.2),  # dark gray
                 metallic=0.0,
                 roughness=0.5,
             ),
@@ -387,12 +387,12 @@ class GraspDrillSceneCfg(InteractiveSceneCfg):
             collision_props=sim_utils.CollisionPropertiesCfg(
                 collision_enabled=True,
                 contact_offset=0.005,
-                rest_offset=0.001,     # 必须 < contact_offset
+                rest_offset=0.001,     # must be < contact_offset
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.0),  # 0 = 静态物体
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.0),  # 0 = static object
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0, 0.0, 0.0),  # 桌子高度将在 reset 时设置（基于 drill 初始位置）
+            pos=(0, 0.0, 0.0),  # table height set at reset (based on drill initial position)
         ),
     )
     
@@ -407,8 +407,8 @@ class GraspDrillSceneCfg(InteractiveSceneCfg):
 @configclass
 class GraspDrillEnvCfg(DirectRLEnvCfg):
 
-    action_space = 13  # Panda 7臂关节(绝对) + Inspire Hand 6近端关节(增量) = 13维
-    # 观测: 关节(13*2) + drill位置速度euler(12) + 关键距离(2) + link_dists(7) + hand_base(7) + goal_quat(4) + contact_forces(13) = 71维
+    action_space = 13  # Panda 7 arm joints (absolute) + Inspire Hand 6 proximal joints (incremental) = 13 dims
+    # obs: joints(13*2) + drill pos/vel/euler(12) + key distances(2) + link_dists(7) + hand_base(7) + goal_quat(4) + contact_forces(13) = 71 dims
     observation_space = 71
     total_num_variants: int = 3  # one-hot dim; set via create_grasp_drill_env_cfg; NEVER change after training
     scene: GraspDrillSceneCfg = MISSING
@@ -417,7 +417,7 @@ class GraspDrillEnvCfg(DirectRLEnvCfg):
     terminations: Dict[str, DoneTerm] = MISSING
     events: Dict[str, EventTerm] = MISSING
     num_envs: int = 256 
-    decimation: int = 3 
+    decimation: int = 2
     episode_length_s: float = 10  
     fall_dist: float = 0.10 
     lift_z_threshold: float = 0.03 
@@ -427,13 +427,13 @@ class GraspDrillEnvCfg(DirectRLEnvCfg):
     action_smoothing: float = 0.1
     max_joint_delta: float = 0.01
     max_finger_delta: float = 0.03
-    # 点云配置
+    # point cloud config
     pc_num_points: int = 512
     tiled_camera_cfg: TiledCameraCfg | None = None  # for distillation
 
     def __post_init__(self):
-        """Post initialization - 配置仿真参数"""
-        from .config.hyperparameters import DEFAULT_HYPERPARAMETERS
+        """Post initialization - configure simulation params"""
+        from .config.config import DEFAULT_HYPERPARAMETERS
         self.sim.dt = DEFAULT_HYPERPARAMETERS.simulation.dt
 
         self.sim.physx.solver_type = 1  # 0=PGS, 1=TGS
@@ -478,9 +478,9 @@ class _SingleDrillHandle:
 _failure_active_names_cache = None
 
 def _get_active_failure_names() -> set:
-    """解析源码中 _check_failure() 的 failure 赋值语句里实际参与的变量名。
-    通过 AST 读取，注释掉的变量不会被 AST 解析出来，从而实现「注释即禁用」。
-    结果会被缓存。"""
+    """Parse the variable names actually used in _check_failure()'s failure assignment.
+    Read via AST: commented-out variables are not parsed, so "comment = disable".
+    The result is cached."""
     global _failure_active_names_cache
     if _failure_active_names_cache is not None:
         return _failure_active_names_cache
@@ -574,26 +574,26 @@ class GraspDrillEnv(DirectRLEnv):
         super().__init__(cfg, render_mode=render_mode, **kwargs)
 
         self.franka: Articulation = self.scene["franka"]
-        self.debug = debug  # 调试模式
+        self.debug = debug  # debug mode
 
         self._drill = self.scene["drill"]
         self._drill._is_initialized = False  # force re-init on first reset
         self.drill = _SingleDrillHandle(self)
 
         # ============================================================
-        # 摩擦参数设置（IsaacLab 官方方式：PhysX tensor API）
+        # friction params (IsaacLab official way: PhysX tensor API)
         # ============================================================
         try:
-            # 读取配置参数（从 sim_params 中）
-            # 灵巧手
+            # read config params (from sim_params)
+            # dexterous hand
             hand_s = getattr(self.cfg.sim_params, 'hand_static_friction', 1.0)
             hand_d = getattr(self.cfg.sim_params, 'hand_dynamic_friction', 1.0)
             hand_r = getattr(self.cfg.sim_params, 'hand_restitution', 0.0)
-            # 电钻
+            # drill
             drill_s = getattr(self.cfg.sim_params, 'drill_static_friction', 1.0)
             drill_d = getattr(self.cfg.sim_params, 'drill_dynamic_friction', 1.0)
             drill_r = getattr(self.cfg.sim_params, 'drill_restitution', 0.0)
-            # 桌子
+            # table
             table_s = getattr(self.cfg.sim_params, 'table_static_friction', 0.5)
             table_d = getattr(self.cfg.sim_params, 'table_dynamic_friction', 0.4)
             table_r = getattr(self.cfg.sim_params, 'table_restitution', 0.0)
@@ -602,7 +602,7 @@ class GraspDrillEnv(DirectRLEnv):
             num_envs = self.num_envs
             all_env_ids = torch.arange(num_envs, device=cpu)
 
-            # --- 灵巧手 ---
+            # --- dexterous hand ---
             franka_num_shapes = self.franka.root_physx_view.max_shapes
             franka_mats = torch.full((num_envs, franka_num_shapes, 3), 0.0, dtype=torch.float32, device=cpu)
             franka_mats[:, :, 0] = hand_s
@@ -611,7 +611,7 @@ class GraspDrillEnv(DirectRLEnv):
             self.franka.root_physx_view.set_material_properties(franka_mats, all_env_ids)
             print(f"[FRICTION] Hand: s={hand_s}, d={hand_d}, r={hand_r}, {franka_num_shapes} shapes x {num_envs} envs", flush=True)
 
-            # --- 电钻 ---
+            # --- drill ---
             drill_num_shapes = self._drill.root_physx_view.max_shapes
             drill_mats = torch.full((num_envs, drill_num_shapes, 3), 0.0, dtype=torch.float32, device=cpu)
             drill_mats[:, :, 0] = drill_s
@@ -620,7 +620,7 @@ class GraspDrillEnv(DirectRLEnv):
             self._drill.root_physx_view.set_material_properties(drill_mats, all_env_ids)
             print(f"[FRICTION] Drill: s={drill_s}, d={drill_d}, r={drill_r}, {drill_num_shapes} shapes x {num_envs} envs", flush=True)
 
-            # --- 桌子 ---
+            # --- table ---
             try:
                 table_asset = self.scene["table"]
                 table_num_shapes = table_asset.root_physx_view.max_shapes
@@ -663,7 +663,7 @@ class GraspDrillEnv(DirectRLEnv):
             try:
                 trigger_pts, body_filtered, body_all, _ = self._build_variant_surface_points(vid)
                 self._variant_attrs[vid]["body_surface_points"] = body_filtered
-                # 500点，不过滤，用于DP3点云
+                # 500 points, no filtering, for DP3 point cloud
                 all_pts = self._variant_attrs[vid]["mesh_points"]
                 if all_pts is not None and len(all_pts) > 0:
                     n = min(500, len(all_pts))
@@ -680,7 +680,7 @@ class GraspDrillEnv(DirectRLEnv):
         self._table_impact_force_threshold = drill_gravity * 10
           # [N]
 
-        # 成功保持计数器（滑动窗口）
+        # success-hold counter (sliding window)
         self._success_window_size = 50
         self._success_window_idx = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
@@ -715,12 +715,12 @@ class GraspDrillEnv(DirectRLEnv):
         self._env_drill_attrs: dict[int, dict] = {}
 
         # if self.debug:
-        #     print(f"[DEBUG] 最终 contact_sensors 数量: 0 (使用 external forces)")
+        #     print(f"[DEBUG] final contact_sensors count: 0 (using external forces)")
         #     body_names = self.franka.body_names
         #     print(f"[DEBUG] fr3 body_names ({len(body_names)}):")
-        #     for name in body_names[:15]:  # 只打印前15个
+        #     for name in body_names[:15]:  # only print first 15
         #         print(f"    - {name}")
-        #     print(f"[DEBUG] ... (共 {len(body_names)} 个 body)")
+        #     print(f"[DEBUG] ... ({len(body_names)} bodies total)")
 
         force_attrs = [attr for attr in dir(self.franka.data) if 'force' in attr.lower()]
 
@@ -741,20 +741,21 @@ class GraspDrillEnv(DirectRLEnv):
         self._normal_timeout_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._pending_nan_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._cached_failure_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cached_hard_fail_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._cached_knocked_away_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        # _active_failure_reasons 会在 _check_failure() 首次调用时自动设置
+        # _active_failure_reasons is set automatically on the first _check_failure() call
         self._active_failure_reasons = set()
 
         self.initial_drill_pos = torch.zeros(self.num_envs, 3, device=self.device)
-        self.initial_drill_pos[:, 2] = 0.15  # 默认高度 15cm (桌子表面上方)
+        self.initial_drill_pos[:, 2] = 0.15  # default height 15cm (above table surface)
 
-        self.contact_history_len = 5 # 记录过去 10 步
+        self.contact_history_len = 5 # record past 10 steps
         self.contact_history_buffer = torch.zeros(
             self.num_envs, self.contact_history_len, 
             dtype=torch.bool, device=self.device
         )
         
-        self.obs_history_len = 3  # 记录过去 3 帧
+        self.obs_history_len = 3  # record past 3 frames
         num_joints = len(self.franka.joint_names)
         self.joint_pos_history = torch.zeros(
             self.num_envs, self.obs_history_len, num_joints,
@@ -765,11 +766,11 @@ class GraspDrillEnv(DirectRLEnv):
             dtype=torch.float32, device=self.device
         )
         self.finger_dist_history = torch.zeros(
-            self.num_envs, self.obs_history_len, 5,  # 5个手指
+            self.num_envs, self.obs_history_len, 5,  # 5 fingers
             dtype=torch.float32, device=self.device
         )
         
-        self._reward_print_count = 0  # 用于调试输出
+        self._reward_print_count = 0  # for debug output
         
         self._reward_components = {
             "approach": torch.zeros(self.num_envs, device=self.device),
@@ -777,9 +778,9 @@ class GraspDrillEnv(DirectRLEnv):
         }
         self._initial_upright_score = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._drill_goal_quat_per_env = torch.zeros(self.num_envs, 4, dtype=torch.float32, device=self.device)  # per-env goal quat
-        # 势函数塑形:存上一步的朝向接近度 Φ,朝向 reward = scale*(Φ_now - Φ_prev)。
-        # reset 时被覆盖成新一局初始姿态的 Φ(见 _reset_idx 末尾),切断跨局残留,
-        # 使站立/躺下都从各自初始 Φ 起步,消除初始姿态造成的 reward 基线差。
+        # potential-based shaping: store previous-step orientation closeness Phi, orientation reward = scale*(Phi_now - Phi_prev).
+        # overwritten at reset with the new episode's initial-pose Phi (see end of _reset_idx), cutting cross-episode residue,
+        # so standing/lying-down both start from their own initial Phi, removing the reward baseline gap from initial pose.
         self._upright_phi_prev = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._euler_phi_prev = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
         self._episode_reward_sums = {
@@ -838,7 +839,7 @@ class GraspDrillEnv(DirectRLEnv):
         self.controlled_joint_names = [
             "fr3_joint1", "fr3_joint2", "fr3_joint3", "fr3_joint4",
             "fr3_joint5", "fr3_joint6", "fr3_joint7",
-        # Inspire Hand 6近端关节
+        # Inspire Hand 6 proximal joints
         "R_index_proximal_joint", "R_middle_proximal_joint",
         "R_pinky_proximal_joint", "R_ring_proximal_joint",
         "R_thumb_proximal_yaw_joint", "R_thumb_proximal_pitch_joint",
@@ -1248,16 +1249,16 @@ class GraspDrillEnv(DirectRLEnv):
             traceback.print_exc()
 
     def _add_approach_links_frame_visualization(self, stage, drill_prim_path_tpl: str):
-        """为所有 approach 相关的 link 添加坐标系可视化（只对 env_0 的 hand 加一次）"""
+        """Add frame visualization for all approach-related links (added once for env_0's hand only)"""
         try:
             from pxr import UsdGeom, Gf
 
-            # 获取 hand 的 prim path (Articulation) - 只在 env_0 上加
+            # get hand prim path (Articulation) - only add on env_0
             hand_prim_path = str(self.franka.cfg.prim_path)
             if "env_.*" in hand_prim_path:
                 hand_prim_path = hand_prim_path.replace("env_.*", "env_0")
 
-            # Inspire Hand 的实际路径: /fr3_inspire_hand/
+            # actual Inspire Hand path: /fr3_inspire_hand/
             inspire_hand_path = hand_prim_path
 
             approach_links = [
@@ -1268,25 +1269,25 @@ class GraspDrillEnv(DirectRLEnv):
                 "R_thumb_distal",
             ]
 
-            # 获取 hand 的 body 名称
+            # get hand body names
             body_names = self.franka.body_names
 
             for link_name in approach_links:
-                # 使用 inspire_hand_path 而不是 hand_prim_path
+                # use inspire_hand_path instead of hand_prim_path
                 link_prim_path = f"{inspire_hand_path}/{link_name}"
                 link_prim = stage.GetPrimAtPath(link_prim_path)
 
                 if not link_prim:
                     continue
 
-                # 创建 frame prim
+                # create frame prim
                 frame_prim_path = f"{link_prim_path}/FrameVisualizer"
                 frame_prim = stage.GetPrimAtPath(frame_prim_path)
 
                 if frame_prim:
                     continue
 
-                # 创建 Xform 并添加 frame
+                # create Xform and add frame
                 xform = UsdGeom.Xform.Define(stage, frame_prim_path)
                 frame_prim = xform.GetPrim()
 
@@ -1294,9 +1295,9 @@ class GraspDrillEnv(DirectRLEnv):
                 references = frame_prim.GetReferences()
                 references.AddReference(frame_usd_path)
 
-                # 设置坐标系 scale
+                # set frame scale
                 frame_xform = UsdGeom.Xformable(frame_prim)
-                frame_xform.AddScaleOp().Set(Gf.Vec3f(0.05, 0.05, 0.05))  # 较小
+                frame_xform.AddScaleOp().Set(Gf.Vec3f(0.05, 0.05, 0.05))  # smaller
 
 
 
@@ -1310,11 +1311,11 @@ class GraspDrillEnv(DirectRLEnv):
 
     def _apply_action(self) -> None:
         # actions: [num_envs, 13]
-        # 前 7 维: Panda 臂绝对位置 (action in [-1, 1])
-        # 后 6 维: 手指关节增量 (action in [-1, 1] -> delta in [-max_finger_delta, max_finger_delta])
+        # first 7 dims: Panda arm absolute position (action in [-1, 1])
+        # last 6 dims: finger joint increments (action in [-1, 1] -> delta in [-max_finger_delta, max_finger_delta])
         range_len = self.joint_upper_limits - self.joint_lower_limits
 
-        # --- Panda 臂: 绝对位置映射 ---
+        # --- Panda arm: absolute position mapping ---
         arm_actions = self.actions[:, : self.num_arm_joints]
         arm_raw = 0.5 * (arm_actions + 1.0) * range_len[: self.num_arm_joints].unsqueeze(0) + self.joint_lower_limits[: self.num_arm_joints].unsqueeze(0)
 
@@ -1330,12 +1331,12 @@ class GraspDrillEnv(DirectRLEnv):
         else:
             self.cur_targets[:, : self.num_arm_joints] = arm_smoothed
 
-        # --- 手指: 增量控制 ---
+        # --- fingers: incremental control ---
         finger_actions = self.actions[:, self.num_arm_joints :]
         finger_delta = finger_actions * self.max_finger_delta
         self.cur_targets[:, self.num_arm_joints :] = self.cur_targets[:, self.num_arm_joints :] + finger_delta
 
-        # --- 安全裁剪 ---
+        # --- safety clip ---
         self.cur_targets = math_utils.saturate(
             self.cur_targets,
             self.joint_lower_limits.unsqueeze(0),
@@ -1359,12 +1360,12 @@ class GraspDrillEnv(DirectRLEnv):
                 draw_interface.clear_points()
             except Exception:
                 pass        
-        from .mdp import rewards_optimized as reward_funcs
+        from .mdp import rewards as reward_funcs
         from isaaclab.managers import SceneEntityCfg
         
         total_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        # euler_gate:门控因子,由下面 r_euler 块用"到 goal_quat 的夹角"算出真值。
-        # 默认 1.0,防止 r_euler 块异常时后续 thumb/tip/success 引用到未定义变量。
+        # euler_gate: gating factor, computed by the r_euler block below from the angle to goal_quat.
+        # default 1.0, so if the r_euler block fails the later thumb/tip/success do not reference an undefined variable.
         euler_gate = torch.ones(self.num_envs, device=self.device)
         try:
             drill_quat = self.drill.data.root_quat_w
@@ -1381,9 +1382,9 @@ class GraspDrillEnv(DirectRLEnv):
             curr_up_z = torch.nan_to_num(curr_up_z, nan=0.0)
             self._cached_upright_score = curr_up_z
 
-            # 势函数塑形(γ=1):r = scale*(Φ_now - Φ_prev)。只奖励"朝直立的进展":
-            # 站立(Φ≈1 不变)→0、扶正→正、被碰歪(Φ 下降)→负。Φ_prev 在 reset 时
-            # 重置为新一局初始 Φ,消除站立/躺下的初始基线差。Φ_upright 取绝对直立度[0,1]。
+            # potential-based shaping (gamma=1): r = scale*(Phi_now - Phi_prev). Only rewards progress toward upright:
+            # standing (Phi~1 unchanged)->0, righting->positive, knocked over (Phi drops)->negative. Phi_prev is reset
+            # at reset to the new episode's initial Phi, removing the standing/lying baseline gap. Phi_upright is absolute uprightness [0,1].
             ORIENT_SCALE = 500.0
             phi_upright = curr_up_z.clamp(0.0, 1.0)
             r_upright = ORIENT_SCALE * (phi_upright - self._upright_phi_prev)
@@ -1399,23 +1400,23 @@ class GraspDrillEnv(DirectRLEnv):
             vid = self._drill_variant_indices.long().flatten()
             drill_quat = self.drill.data.root_quat_w
             drill_quat_norm = torch.nn.functional.normalize(drill_quat, dim=1)
-            goal_quats = self._drill_goal_quat_per_env  # [num_envs, 4]，已在 reset 时固定
+            goal_quats = self._drill_goal_quat_per_env  # [num_envs, 4], fixed at reset
 
-            # 当前与目标四元数夹角（已归一化）
-            dot = (drill_quat_norm * goal_quats).sum(dim=1).abs()  # abs 处理 q 和 -q 同姿态
+            # angle between current and target quaternion (normalized)
+            dot = (drill_quat_norm * goal_quats).sum(dim=1).abs()  # abs handles q and -q as same pose
             dot = dot.clamp(-1.0, 1.0)
             angle = 2.0 * torch.acos(dot)
 
-            # euler_gate:用"到 goal_quat 的夹角"做门控(替代原 upright_gate 的绝对直立度)。
-            # 越接近目标朝向 → 门越大 → thumb/tip/success 放大越多,直接激励"转到目标朝向";
-            # 且"直立但朝向错"也会被压低门,比纯直立度更贴合任务目标。
-            _GATE_ANG_MIN = 0.1745   # 10°:此内满门=1
-            _GATE_ANG_MAX = 2.0944   # 120°:此外降到下限 0.01
+            # euler_gate: gate by the angle to goal_quat (replaces the old upright_gate absolute uprightness).
+            # closer to target orientation -> larger gate -> thumb/tip/success amplified more, directly encouraging turning to target;
+            # "upright but wrong orientation" also gets a lowered gate, fitting the task goal better than pure uprightness.
+            _GATE_ANG_MIN = 0.1745   # 10deg: within this the gate is full=1
+            _GATE_ANG_MAX = 2.0944   # 120deg: beyond this it drops to the floor 0.01
             _gate_raw = torch.clamp((_GATE_ANG_MAX - angle) / (_GATE_ANG_MAX - _GATE_ANG_MIN), 0.0, 1.0)
             euler_gate = torch.clamp(_gate_raw ** 2, 0.01, 1.0)
 
             euler_temp = 0.5
-            # 绝对值奖励:离 goal_quat 越近给分越多(每步都给,不是势差)。
+            # absolute-value reward: the closer to goal_quat the more score (given every step, not a potential difference).
             r_euler = torch.exp(-angle / euler_temp) * 20
 
             self._reward_components["r_euler"] = r_euler
@@ -1495,8 +1496,8 @@ class GraspDrillEnv(DirectRLEnv):
         #         self,
         #         base_weight=200.0,       
         #         bonus_per_contact =10,
-        #         success_contact_force_threshold=0.01,  # 接触力阈值
-        #         drill_scale=(1, 1.2, 1),     # 电钻缩放
+        #         success_contact_force_threshold=0.01,  # contact force threshold
+        #         drill_scale=(1, 1.2, 1),     # drill scale
         #     )
         #     self._reward_components["success"] = success_reward * upright_gate
         #     total_reward += success_reward * upright_gate          
@@ -1518,7 +1519,7 @@ class GraspDrillEnv(DirectRLEnv):
         try:
             drill_ang_vel = self.drill.data.root_ang_vel_w
             ang_vel_norm = torch.norm(drill_ang_vel, dim=1)  # [num_envs]
-            max_ang_vel = 2.0  # 2 rad/s 以上开始惩罚
+            max_ang_vel = 2.0  # penalize above 2 rad/s
             ang_vel_penalty = torch.where(
                 ang_vel_norm > max_ang_vel,
                 -1.0 * (ang_vel_norm - max_ang_vel),
@@ -1550,11 +1551,11 @@ class GraspDrillEnv(DirectRLEnv):
 
 
 
-        # === 电钻线速度惩罚 ===
+        # === drill linear velocity penalty ===
         try:
             drill_lin_vel = self.drill.data.root_lin_vel_w
             lin_vel_norm = torch.norm(drill_lin_vel, dim=1)
-            max_lin_vel = 0.3  # 0.3 m/s 以上开始惩罚
+            max_lin_vel = 0.3  # penalize above 0.3 m/s
             lin_vel_penalty = torch.where(
                 lin_vel_norm > max_lin_vel,
                 -1.0 * (lin_vel_norm - max_lin_vel),
@@ -1591,7 +1592,7 @@ class GraspDrillEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
 
 
-        # === NaN 自动检测和重置 ===
+        # === automatic NaN detection and reset ===
         hand_body_pos = self.franka.data.body_pos_w
         hand_nan_mask = torch.isnan(hand_body_pos).any(dim=2).any(dim=1)
 
@@ -1637,7 +1638,7 @@ class GraspDrillEnv(DirectRLEnv):
                     data = sensor.data.__getattribute__(attr)
                     if data is None:
                         continue
-                    # 统一处理：展平除 batch 维外的所有维度，检测是否有 NaN
+                    # uniform handling: flatten all dims except batch, detect any NaN
                     flat = data.reshape(data.shape[0], -1)
                     sensor_nan_mask |= torch.isnan(flat).any(dim=1)
 
@@ -1681,40 +1682,44 @@ class GraspDrillEnv(DirectRLEnv):
         lenient_success = self._success_window.sum(dim=1) >= 20
         time_outs = self.episode_length_buf >= self.max_episode_length
         terminated_nan_mask = self._pending_nan_mask
-        terminated = failure_terminated | terminated_nan_mask | proximal_limit_terminated 
+        terminated = failure_terminated | terminated_nan_mask | proximal_limit_terminated | lenient_success
         truncated = time_outs 
 
         self._cached_failure_mask = failure_terminated
         self._cached_lenient_success = lenient_success
+        # terminated MINUS the lenient_success contribution: failure/nan/proximal-limit only. Lets a
+        # subclass (ChainedEnv) use its OWN, different grasp-hold criterion to decide when phase 0
+        # resolves, without the base 20-in-50 window also independently ending the episode first.
+        self._cached_hard_fail_mask = failure_terminated | terminated_nan_mask | proximal_limit_terminated
         self._normal_timeout_mask = time_outs & ~failure_terminated & ~terminated_nan_mask & ~proximal_limit_terminated
 
         return terminated, truncated
 
     def _setup_physics_scene(self):
-        """为 Inspire Hand 的 link 添加物理 API，启用 contact sensor"""
+        """Add physics API to Inspire Hand links, enabling contact sensors"""
         try:
             from pxr import Usd, UsdPhysics, UsdGeom
             import omni.usd
             
             stage = omni.usd.get_context().get_stage()
             if stage is None:
-                print("[WARN] _setup_physics_scene: 无法获取 USD stage")
+                print("[WARN] _setup_physics_scene: cannot get USD stage")
                 return
             
             franka_asset = self.scene["franka"]
-            franka_prim = franka_asset._prim  # 内部 _prim 属性
+            franka_prim = franka_asset._prim  # internal _prim attribute
             if franka_prim is None:
-                print("[WARN] _setup_physics_scene: franka._prim 为 None，尝试其他方式")
-                # 尝试通过 body_names 获取路径
+                print("[WARN] _setup_physics_scene: franka._prim is None, trying another way")
+                # try to get path via body_names
                 body_pos = franka_asset.data.body_pos_w
                 if body_pos is not None and body_pos.shape[0] > 0:
-                    print("[DEBUG] _setup_physics_scene: 可以通过 body_pos 访问 franka")
+                    print("[DEBUG] _setup_physics_scene: can access franka via body_pos")
                 return
             
             franka_path = str(franka_prim.GetPath())
             print(f"[DEBUG] _setup_physics_scene: franka_path = {franka_path}")
             
-            # 手部 link 名称列表
+            # hand link name list
             hand_body_names = [
                 "R_hand_base_link",
                 "R_index_proximal", "R_index_intermediate",
@@ -1724,10 +1729,10 @@ class GraspDrillEnv(DirectRLEnv):
                 "R_thumb_proximal_base", "R_thumb_proximal", "R_thumb_intermediate",
             ]
             
-            # 只保留在 body_names 中存在的 link
+            # keep only links that exist in body_names
             available_bodies = [name for name in hand_body_names if name in self.franka.body_names]
             
-            # 为每个 link 添加物理 API
+            # add physics API to each link
             for body_name in available_bodies:
                 prim_path = f"{franka_path}/{body_name}"
                 prim = stage.GetPrimAtPath(prim_path)
@@ -1735,33 +1740,33 @@ class GraspDrillEnv(DirectRLEnv):
                 if not prim.IsValid():
                     continue
                 
-                # 检查是否已有 RigidBodyAPI
+                # check if RigidBodyAPI already exists
                 has_rb = prim.HasAPI(UsdPhysics.RigidBodyAPI)
                 has_collider = prim.HasAPI(UsdPhysics.CollisionAPI)
                 
                 if not has_rb:
-                    # 添加 RigidBodyAPI
+                    # add RigidBodyAPI
                     rb_api = UsdPhysics.RigidBodyAPI.Apply(prim)
                     rb_api.CreateLinearVelocityAttr()
                     rb_api.CreateAngularVelocityAttr()
                 
                 if not has_collider:
                     collider_api = UsdPhysics.CollisionAPI.Apply(prim)
-                # 检查并添加 ContactReporterAPI（contact sensor 需要这个）
+                # check and add ContactReporterAPI (needed by contact sensor)
                 if not prim.HasAPI(UsdPhysics.ContactReporterAPI):
                     contact_api = UsdPhysics.ContactReporterAPI.Apply(prim)
 
-            # 强制刷新 stage
+            # force-refresh stage
             stage.Save()
             
         except ImportError as e:
-            print(f"[WARN] _setup_hand_contact_sensors: 无法导入 pxr 模块: {e}")
+            print(f"[WARN] _setup_hand_contact_sensors: cannot import pxr module: {e}")
         except Exception as e:
             import traceback
             traceback.print_exc()
 
     def _setup_scene(self):
-        """设置场景 - DirectRLEnv 版本"""
+        """Set up the scene - DirectRLEnv version"""
         super()._setup_scene()
 
         try:
@@ -1770,11 +1775,11 @@ class GraspDrillEnv(DirectRLEnv):
             
             stage = omni.usd.get_context().get_stage()
             
-            # === 1. 配置手部关节 (Inspire Hand on fr3) ===
+            # === 1. configure hand joints (Inspire Hand on fr3) ===
             inspire_hand_path = "/World/envs/env_0/fr3_inspire_hand"
             joints_path = f"{inspire_hand_path}/joints"
             
-            # 需要禁用的中间关节 Mimic Joint
+            # intermediate Mimic joints to disable
             intermediate_joints = [
                 "R_index_intermediate_joint",
                 "R_middle_intermediate_joint",
@@ -1784,7 +1789,7 @@ class GraspDrillEnv(DirectRLEnv):
                 "R_thumb_distal_joint",
             ]
             
-            # 需要配置 Drive 的近端关节
+            # proximal joints that need Drive configured
             proximal_joints = [
                 "R_index_proximal_joint",
                 "R_middle_proximal_joint",
@@ -1896,7 +1901,7 @@ class GraspDrillEnv(DirectRLEnv):
         obs_list.append(joint_pos[:, proximal_joint_indices])
         obs_list.append(joint_vel[:, proximal_joint_indices])
 
-        drill_pos_w = self.drill.data.root_pos_w  # 世界坐标（用于距离计算）
+        drill_pos_w = self.drill.data.root_pos_w  # world coordinates (for distance computation)
         drill_quat = self.drill.data.root_quat_w
         drill_lin_vel = self.drill.data.root_lin_vel_w
         drill_ang_vel = self.drill.data.root_ang_vel_w
@@ -2018,23 +2023,23 @@ class GraspDrillEnv(DirectRLEnv):
         drill_up_axis = torch.bmm(R_drill, self._up_axis.unsqueeze(-1)).squeeze(-1)  # R @ v_local = v_world
 
         contact_forces_raw = self._get_contact_forces_obs()
-        contact_forces = torch.log1p(contact_forces_raw) / torch.log1p(torch.tensor(50.0, device=self.device))  # 归一化
+        contact_forces = torch.log1p(contact_forces_raw) / torch.log1p(torch.tensor(50.0, device=self.device))  # normalize
         goal_quat = self._drill_goal_quat_per_env  # [num_envs, 4]
 
         obs_parts = [
-            joint_pos[:, proximal_joint_indices],               # 关节位置
+            joint_pos[:, proximal_joint_indices],               # joint positions
             joint_vel[:, proximal_joint_indices],
-            drill_pos,                                          # drill 位置 (相对于 env_origin)
-            drill_lin_vel,                                      # drill 线速度 (世界系)
-            drill_ang_vel,                                     # drill 角速度 (世界系)
-            drill_up_axis,                                     # drill up_axis 世界投影 (3维)
-            tip_trigger_dist,                                  # 食指末端 → trigger
-            thumb_target_dist,                                 # 拇指末端 → thumb target
-            link_body_dists,                                   # 各 link → drill body 最近距离
-            hand_base_pos_env,                                 # hand base 位置 (相对于 env_origin)
-            hand_base_quat_env,                                # hand base 四元数 (wxyz) 归一化
-            goal_quat,                                         # 每个 env 的目标四元数
-            contact_forces,                                    # 各 contact sensor 的力大小 (归一化)
+            drill_pos,                                          # drill position (relative to env_origin)
+            drill_lin_vel,                                      # drill linear velocity (world frame)
+            drill_ang_vel,                                     # drill angular velocity (world frame)
+            drill_up_axis,                                     # drill up_axis world projection (3 dims)
+            tip_trigger_dist,                                  # index fingertip -> trigger
+            thumb_target_dist,                                 # thumb tip -> thumb target
+            link_body_dists,                                   # each link -> nearest drill body distance
+            hand_base_pos_env,                                 # hand base position (relative to env_origin)
+            hand_base_quat_env,                                # hand base quaternion (wxyz) normalized
+            goal_quat,                                         # per-env goal quaternion
+            contact_forces,                                    # each contact sensor force magnitude (normalized)
         ]
         observations = torch.cat(obs_parts, dim=1)
 
@@ -2077,7 +2082,7 @@ class GraspDrillEnv(DirectRLEnv):
 
     def _debug_action_manager(self):
 
-        print(f"\n动作空间 (action_space): {self.cfg.action_space}")
+        print(f"\naction space (action_space): {self.cfg.action_space}")
         
         num_joints = len(self.franka.joint_names)
 
@@ -2093,10 +2098,10 @@ class GraspDrillEnv(DirectRLEnv):
         return self._get_contact_forces().sum(dim=1)
 
     def _get_contact_forces_obs(self) -> torch.Tensor:
-        """获取所有 contact sensor 的力大小，用于观测。
+        """Get the force magnitude of all contact sensors, for observation.
 
         Returns:
-            contact_forces: [num_envs, num_sensors] 各 sensor 检测到的力大小 (标量)
+            contact_forces: [num_envs, num_sensors] force magnitude per sensor (scalar)
         """
         all_hand_sensors = [
             "contact_index_intermediate",
@@ -2283,7 +2288,7 @@ class GraspDrillEnv(DirectRLEnv):
             multi_contact_ok = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         success = finger_near_trigger & multi_contact_ok & thumb_near_target
-        # Debug 输出
+        # Debug output
         if self.debug and hasattr(self, '_success_debug_counter'):
             self._success_debug_counter += 1
             if self._success_debug_counter % 10 == 0:
@@ -2504,9 +2509,6 @@ class GraspDrillEnv(DirectRLEnv):
 
         env_origins = self.scene.env_origins[env_ids]
 
-        # --- overfit 测试钩子:外部(deploy)注入电钻初始位姿/goal 以回放 collect 记录的场景 ---
-        # 设了 self._drill_pose_override_fn(env_ids, variant_ids)->(pos_local[n,3],quat[n,4],goal[n,4])
-        # 就用注入值、跳过随机采样;否则走原随机分支(collect 用)。
         _override = getattr(self, "_drill_pose_override_fn", None)
         if _override is not None:
             _pl, _q, _g = _override(env_ids, variant_ids)
@@ -2532,7 +2534,7 @@ class GraspDrillEnv(DirectRLEnv):
             _VA = self._variant_attrs
             env_pos_list = []
             env_rot_list = []
-            env_goal_quat_list = []  # per-env goal quat（固定在整个 episode 中）
+            env_goal_quat_list = []  # per-env goal quat (fixed across the whole episode)
             for i, eid in enumerate(env_ids.tolist()):
                 vid = variant_ids[i].item()
                 vdata = _VA[vid]
@@ -2541,7 +2543,7 @@ class GraspDrillEnv(DirectRLEnv):
                 idx = torch.randint(0, num_poses, (1,), device=self.device).item()
                 env_pos_list.append(pos_list[idx])
                 env_rot_list.append(vdata["initial_rot_list"][idx])
-                # 随机选择一个 goal，并固定在 env 级别
+                # randomly pick a goal, fixed at env level
                 goal_list = vdata["goal_rot_list"]  # [G, 4]
                 goal_idx = torch.randint(0, goal_list.shape[0], (1,), device=self.device).item()
                 env_goal_quat_list.append(goal_list[goal_idx])
@@ -2607,8 +2609,8 @@ class GraspDrillEnv(DirectRLEnv):
         )
         self._initial_upright_score[env_ids] = initial_up.clamp(-1.0, 1.0).nan_to_num(nan=0.0)
 
-        # 势函数塑形:把朝向 Φ_prev 重置为新一局初始姿态的 Φ,切断上一局残留,
-        # 使新一局的朝向进展从 0 起步(配合 _get_rewards 的 r_upright/r_euler 势差)。
+        # potential-based shaping: reset orientation Phi_prev to the new episode's initial-pose Phi, cutting last episode's residue,
+        # so the new episode's orientation progress starts from 0 (works with _get_rewards' r_upright/r_euler potential difference).
         self._upright_phi_prev[env_ids] = initial_up.clamp(0.0, 1.0).nan_to_num(nan=0.0)
         _gq0 = self._drill_goal_quat_per_env[env_ids]
         _dq0 = torch.nn.functional.normalize(result_quats, dim=1)
@@ -2629,12 +2631,15 @@ def create_grasp_drill_env_cfg(
     img_height: int = 512,
     img_width: int = 512,
     enable_cameras: bool = True,
+    include_plate: bool = False,
+    include_plate_camera: bool = False,
+    include_cam3: bool = None,
 ) -> GraspDrillEnvCfg:
     import os
     from isaaclab.managers import SceneEntityCfg
     
     if hyperparameters is None:
-        from .config.hyperparameters import DEFAULT_HYPERPARAMETERS
+        from .config.config import DEFAULT_HYPERPARAMETERS
         hyperparams = DEFAULT_HYPERPARAMETERS
     else:
         hyperparams = hyperparameters
@@ -2645,7 +2650,7 @@ def create_grasp_drill_env_cfg(
         try:
             with open(drill_config_path, "r") as f:
                 config = yaml.safe_load(f)
-            print(f"✓ 已从 {drill_config_path} 加载配置")
+            print(f"[OK] config loaded from {drill_config_path} successfully")
             
             if "scene" in config:
                 scene_cfg = config["scene"]
@@ -2699,7 +2704,7 @@ def create_grasp_drill_env_cfg(
                 if "rest_offset" in drill_cfg:
                     hyperparams.drill.rest_offset = drill_cfg["rest_offset"]
 
-            # 加载终止条件配置
+            # load termination config
             if "termination" in config:
                 term_cfg = config["termination"]
                 if "lift_z_threshold" in term_cfg:
@@ -2707,7 +2712,7 @@ def create_grasp_drill_env_cfg(
                 if "fall_dist" in term_cfg:
                     hyperparams.termination.fall_dist = term_cfg["fall_dist"]
             
-            # 加载奖励配置
+            # load reward config
             if "reward" in config:
                 reward_cfg = config["reward"]
                 if "distance_reward_weight" in reward_cfg:
@@ -2719,7 +2724,7 @@ def create_grasp_drill_env_cfg(
                 if "success_bonus_weight" in reward_cfg:
                     hyperparams.reward.success_bonus_weight = reward_cfg["success_bonus_weight"]
             
-            # 加载动作配置
+            # load action config
             if "action" in config:
                 action_cfg = config["action"]
                 if "wrist_pos_scale" in action_cfg:
@@ -2731,11 +2736,11 @@ def create_grasp_drill_env_cfg(
             
             
         except Exception as e:
-            print(f"⚠ 加载配置文件失败: {e}，使用默认值")
+            print(f"[WARN] failed to load config file: {e}, using defaults")
     
     cfg = GraspDrillEnvCfg()
 
-    # 基本参数
+    # basic params
     cfg.num_envs = num_envs
     cfg.device = device
     cfg.headless = headless
@@ -2842,7 +2847,7 @@ def create_grasp_drill_env_cfg(
         spawn=sim_utils.CuboidCfg(
             size=(1.5, 1.5, 0.5),  
             visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.3, 0.3, 0.35),  # 蓝灰色
+                diffuse_color=(0.3, 0.3, 0.35),  # blue-gray
                 metallic=0.1,
                 roughness=0.6,
             ),
@@ -2866,7 +2871,7 @@ def create_grasp_drill_env_cfg(
         prim_path="/World/envs/env_.*/fr3_inspire_hand",
         spawn=sim_utils.UsdFileCfg(
             usd_path="assets/inspire_tac/fr3_inspire_hand_right/fr3_inspire_hand_right.usd",
-            activate_contact_sensors=True,  # USD 中已有 PhysicsRigidBodyAPI，改用 PhysxRigidBodyAPI 会报错；使用显式 ContactSensorCfg
+            activate_contact_sensors=True,  # USD already has PhysicsRigidBodyAPI; switching to PhysxRigidBodyAPI errors, so use an explicit ContactSensorCfg
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,  
                 solver_position_iteration_count=64,
@@ -2943,7 +2948,7 @@ def create_grasp_drill_env_cfg(
                 "R_thumb_proximal_pitch_joint": 0.1,
             },
                 velocity_limit_sim={
-                    "R_(index|middle|ring|pinky)_proximal_joint": 10.0,  # 提高速度限制
+                    "R_(index|middle|ring|pinky)_proximal_joint": 10.0,  # raise velocity limit
                     "R_thumb_proximal_yaw_joint": 10.0,
                     "R_thumb_proximal_pitch_joint": 10.0,
                 },
@@ -2976,14 +2981,14 @@ def create_grasp_drill_env_cfg(
 
     @configclass
     class PolicyObsCfg(ObsGroup):
-        # 关节状态 (13 proximal joints * 2 = 26维)
+        # joint states (13 proximal joints * 2 = 26 dims)
         hand_joint_pos = ObsTerm(func=obs_hand_joint_pos)
         hand_joint_vel = ObsTerm(func=obs_hand_joint_vel)
         
 
     cfg.observations = {"policy": PolicyObsCfg()}
 
-    from .mdp import rewards_optimized as reward_funcs
+    from .mdp import rewards as reward_funcs
 
     cfg.rewards = {
     }
@@ -3021,11 +3026,17 @@ def create_grasp_drill_env_cfg(
     _cam2_rot = (0.0, 0.0, 0.9659, -0.2588)
     # _cam2_pos = (0.8, 0.2, 2)
     # _cam2_rot = (0.0, 1.0, 0.0, 0.0)
-    def _make_cam_cfg(name, pos, rot):
+    # cam2 (wrist camera) independent resolution: single source PerceptionHyperparameters.cam2_img_height/width,
+    # default 256 (higher than cam1/cam3's img_height/width). collect/deploy both use this function, auto-consistent.
+    _perc = getattr(hyperparams, "perception", None)
+    _cam2_h = getattr(_perc, "cam2_img_height", img_height) if _perc is not None else img_height
+    _cam2_w = getattr(_perc, "cam2_img_width", img_width) if _perc is not None else img_width
+
+    def _make_cam_cfg(name, pos, rot, height=None, width=None):
         return TiledCameraCfg(
             prim_path=f"{{ENV_REGEX_NS}}/{name}",
-            height=img_height,
-            width=img_width,
+            height=img_height if height is None else height,
+            width=img_width if width is None else width,
             offset=CameraCfg.OffsetCfg(pos=pos, rot=rot, convention="ros"),
             update_period=0,
             data_types=["distance_to_image_plane"],
@@ -3036,11 +3047,82 @@ def create_grasp_drill_env_cfg(
                 clipping_range=_cam_clipping,
             ),
         )
+ 
+    _cam1_pos_chained = (1.4, -0.6,1)
+    _cam1_rot_chained = (0.3522, -0.6717, -0.651, -0.0308)         # look-at (0.6, 0.45, 0.25) full table
+    # _cam1_pos_chained = (1.4, -0.5,0.9)
+    # _cam1_rot_chained = (0.3522, -0.6717, -0.651, -0.0308) 
+    
+    _wrist_offset_pos = (-0.0447, 0.0091, -0.082)
+    _wrist_offset_rot = (0.6424, -0.7552, 0.0993, -0.0845)
+
+    _cam2_far = getattr(_perc, "wrist_cam_far_clip", 1.0) if _perc is not None else 1.0
+
+    def _make_wrist_cam_cfg():
+        return TiledCameraCfg(
+            prim_path="{ENV_REGEX_NS}/fr3_inspire_hand/L_flange/WristCam",
+            height=_cam2_h, width=_cam2_w,
+            offset=CameraCfg.OffsetCfg(pos=_wrist_offset_pos, rot=_wrist_offset_rot,
+                                       convention="ros"),
+            update_period=0, data_types=["distance_to_image_plane"],
+            depth_clipping_behavior="none",
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=12.0, horizontal_aperture=_cam_horiz_aperture,
+                clipping_range=(0.01, _cam2_far)),  # near: 12mm wide-angle + far clip _cam2_far
+        )
+
+    # cam3 (plate camera) independent switch: defaults to follow include_plate_camera (backward compatible);
+    # passing include_cam3=False explicitly skips building cam3 while cam2 stays the wrist camera
+    # (e.g. --stage1_only grasp-only collection, point cloud has no plate segment).
+    _include_cam3 = include_plate_camera if include_cam3 is None else bool(include_cam3)
 
     if enable_cameras:
-        cfg.scene.cam1 = _make_cam_cfg("Camera1", _cam1_pos, _cam1_rot)
-        # cam1: 30cm 跟随框采 1024 点(电钻细节);cam2(正上方俯视,位置不变):不跟随,
-        # 在固定工作区采 1024 点(全局上下文,像素充足几乎不塌)。collect/deploy 已同步。
-        cfg.scene.cam2 = _make_cam_cfg("Camera2", _cam2_pos, _cam2_rot)
+        if include_plate_camera:
+            cfg.scene.cam1 = _make_cam_cfg("Camera1", _cam1_pos_chained, _cam1_rot_chained)
+            cfg.scene.cam2 = _make_wrist_cam_cfg()   # cam2 = wrist camera (mounted on L_flange)
+        else:
+            cfg.scene.cam1 = _make_cam_cfg("Camera1", _cam1_pos, _cam1_rot)
+            # cam1: 30cm follow box samples 1024 points (drill detail); cam2 (top-down, fixed position): does not follow,
+            # samples 1024 points in the fixed workspace (global context, enough pixels to barely collapse). collect/deploy in sync.
+            # cam2 uses independent resolution _cam2_h/_cam2_w (default 256), decoupled from cam1/cam3.
+            cfg.scene.cam2 = _make_cam_cfg("Camera2", _cam2_pos, _cam2_rot,
+                                           height=_cam2_h, width=_cam2_w)
+        # cam3 (optional): looks at the plate (the alignment segment of the two-stage distillation). Located between the workspace and plate,
+        # upper side, look-at plate reference pose (0,1,0.5), distance ~1.17m. Point cloud uses
+        # perception.dp3_pointcloud.build_plate_cam_pc (crop centered on the plate's GT pose).
+        if _include_cam3:
+            _cam3_pos = (0.9, 0.45, 1.0)
+            _cam3_rot = (0.4663, -0.7371, -0.4134, 0.2615)
+            cfg.scene.cam3 = _make_cam_cfg("Camera3", _cam3_pos, _cam3_rot)
+
+        # -- Plate (globally optional): needed by stage2 / chained play; not added by default in stage1 training,
+        #    to avoid changing the DP3-collected point cloud composition. Pose randomization in Stage2Env._randomize_plate.
+    if include_plate:
+        cfg.scene.plate = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Plate",
+            spawn=sim_utils.UsdFileCfg(
+                usd_path=os.path.join(_assets_dir, "plate.usd"),
+                activate_contact_sensors=True,
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    collision_enabled=True,
+                    contact_offset=0.005,
+                    rest_offset=0.001,
+                ),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=True,
+                ),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=(0, 1, 0.5),
+                rot=(0, 0.0, 0.0, 1),
+            ),
+        )
+        # drill-plate collision detection sensor (rigid body at /Plate/Meshes)
+        cfg.scene.contact_plate = ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Plate/Meshes",
+            update_period=0.02,
+            history_length=0,
+            force_threshold=0.01,
+        )
 
     return cfg

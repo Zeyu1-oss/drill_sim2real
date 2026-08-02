@@ -1,6 +1,5 @@
 drill_variants:
-  # Variant 0: drill2 (original METER-UNIT mesh, separate Object_2 trigger)
-  # local +Y is world-up
+
   - name: drill2
     variant_index: 0
     enabled: true

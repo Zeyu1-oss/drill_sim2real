@@ -1,9 +1,9 @@
 """
-任务模块
-包含灵巧手抓取电钻的相关任务实现
+Task module.
+Task implementations for dexterous-hand drill grasping.
 """
 
-# 导出RL环境（延迟导入，避免在没有Isaac Lab时出错）
+# Export RL env (lazy import so it doesn't fail without Isaac Lab).
 __all__ = [
     "GraspDrillEnv",
     "GraspDrillEnvCfg",
@@ -13,5 +13,5 @@ __all__ = [
 try:
     from .grasp_drill_env import GraspDrillEnv, GraspDrillEnvCfg, create_grasp_drill_env_cfg
 except ImportError:
-    # 如果没有Isaac Lab，不导出RL环境
+    # No Isaac Lab: skip exporting the RL env.
     pass

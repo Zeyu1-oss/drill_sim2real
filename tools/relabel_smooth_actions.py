@@ -1,16 +1,19 @@
-"""离线重标注:把现有 zarr 的动作标签换成前向滑动平均(消 teacher 的 PWM 抖动)。
+"""Offline relabel: replace an existing zarr's action labels with a forward moving average
+(removes the teacher's PWM jitter).
 
-与 collect_dp3_data.py --label_smooth_k 用同一个函数(perception.target_drive.
-smooth_labels_forward),所以"重标注旧数据"与"用新脚本重采"结果一致,省一次全量仿真。
+Uses the same function as collect_dp3_data.py --label_smooth_k (perception.target_drive.
+smooth_labels_forward), so "relabel old data" gives the same result as "re-collect with the new
+script", saving a full re-simulation.
 
-安全机制:
-  - 原始 action 先备份到 <zarr>.action_raw_backup.npz(含 episode_ends 对齐检查);
-  - 备份文件已存在时拒绝再次执行(防止双重平滑),--restore 可随时还原;
-  - 检测到 train.py 正在运行时拒绝执行(dataloader 磁盘惰性读,中途改会毒化训练)。
+Safety:
+  - original action is first backed up to <zarr>.action_raw_backup.npz (with episode_ends check);
+  - refuses to run again if the backup already exists (prevents double smoothing); --restore reverts;
+  - refuses to run if train.py is detected running (dataloader lazily reads disk; changing mid-run
+    poisons that training run).
 
-用法:
+Usage:
   python tools/relabel_smooth_actions.py <zarr_path> [--k 8]
-  python tools/relabel_smooth_actions.py <zarr_path> --restore   # 还原原始标签
+  python tools/relabel_smooth_actions.py <zarr_path> --restore   # restore original labels
 """
 import argparse
 import os
@@ -28,16 +31,17 @@ from perception.target_drive import smooth_labels_forward
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("zarr_path")
-    ap.add_argument("--k", type=int, default=8, help="前向滑动平均窗口(步)")
-    ap.add_argument("--restore", action="store_true", help="从备份还原原始 action")
-    ap.add_argument("--force", action="store_true", help="跳过 train.py 运行检测")
+    ap.add_argument("--k", type=int, default=8)
+    ap.add_argument("--restore", action="store_true")
+    ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
     if not args.force:
         r = subprocess.run(["pgrep", "-f", "train.py"], capture_output=True, text=True)
         if r.stdout.strip():
-            sys.exit("[ABORT] 检测到 train.py 正在运行(PID: %s)。训练对 zarr 是磁盘惰性读,"
-                     "中途改标签会毒化该轮训练。请先停训练,或确认无关后加 --force。"
+            sys.exit("[ABORT] train.py detected running (PID: %s). Training reads the zarr lazily "
+                     "from disk; changing labels mid-run poisons that run. Stop training first, or "
+                     "add --force if confirmed unrelated."
                      % r.stdout.strip().replace("\n", ","))
 
     import zarr
@@ -48,31 +52,31 @@ def main():
 
     if args.restore:
         if not os.path.exists(backup_path):
-            sys.exit(f"[ABORT] 无备份文件: {backup_path}")
+            sys.exit(f"[ABORT] no backup file: {backup_path}")
         b = np.load(backup_path)
-        assert np.array_equal(b["episode_ends"], ends), "备份与当前 zarr 的 episode_ends 不一致"
+        assert np.array_equal(b["episode_ends"], ends), "backup and current zarr episode_ends mismatch"
         act[:] = b["action"]
         os.remove(backup_path)
-        print(f"[OK] 已还原原始 action({b['action'].shape}),备份文件已删除。")
+        print(f"[OK] restored original action ({b['action'].shape}), backup file removed.")
         return
 
     if os.path.exists(backup_path):
-        sys.exit(f"[ABORT] 备份已存在: {backup_path}\n"
-                 "该 zarr 已重标注过,再跑会双重平滑。要重做请先 --restore。")
+        sys.exit(f"[ABORT] backup already exists: {backup_path}\n"
+                 "this zarr was already relabeled; running again would double-smooth. Use --restore to redo.")
 
-    A = act[:]                                  # (T,13) ~80MB,载入内存
-    assert A.shape[0] == ends[-1], f"zarr 不一致: action {A.shape[0]} != episode_ends[-1] {ends[-1]}"
+    A = act[:]                                  # (T,13) ~80MB, load into memory
+    assert A.shape[0] == ends[-1], f"zarr inconsistent: action {A.shape[0]} != episode_ends[-1] {ends[-1]}"
     np.savez(backup_path, action=A, episode_ends=ends)
-    print(f"[BACKUP] 原始 action -> {backup_path}")
+    print(f"[BACKUP] original action -> {backup_path}")
 
     starts = np.concatenate([[0], ends[:-1]])
     new = np.empty_like(A)
-    for s, e in zip(starts, ends):              # 逐 episode 平滑(窗口不跨集)
+    for s, e in zip(starts, ends):              # smooth per episode (window does not cross episodes)
         new[s:e] = smooth_labels_forward(A[s:e], args.k)
     act[:] = new
-    print(f"[OK] {len(ends)} 集 / {A.shape[0]} 帧 已重标注 (k={args.k})")
+    print(f"[OK] {len(ends)} episodes / {A.shape[0]} frames relabeled (k={args.k})")
 
-    # ---- 验证:抖动应大降,直流偏置(握力/抗重力)应保留 ----
+    # ---- verify: jitter should drop a lot, DC bias (grip force / anti-gravity) should be kept ----
     rng = np.random.default_rng(0)
     eps = rng.choice(len(ends), min(30, len(ends)), replace=False)
     st = z["data/state"]
@@ -86,10 +90,10 @@ def main():
         gap_new.append((n[-100:, 7:13] - q[-100:, 7:13]).mean())
     sat_old = np.mean([(np.abs(np.diff(A[starts[e]:ends[e], :7], axis=0)) > 0.0195).mean() for e in eps])
     sat_new = np.mean([(np.abs(np.diff(new[starts[e]:ends[e], :7], axis=0)) > 0.0195).mean() for e in eps])
-    print(f"[VERIFY] 手臂逐步|Δ|: {np.mean(dA_old):.4f} -> {np.mean(dA_new):.4f} rad "
-          f"| 贴限速比例: {sat_old*100:.0f}% -> {sat_new*100:.0f}%")
-    print(f"[VERIFY] 手指 hold 压入偏置(应基本不变): {np.mean(gap_old):+.3f} -> {np.mean(gap_new):+.3f} rad")
-    print("[NOTE] 训练端会自动用新标签重算 normalizer;旧 checkpoint 与新标签不兼容,需重训。")
+    print(f"[VERIFY] arm per-step |d|: {np.mean(dA_old):.4f} -> {np.mean(dA_new):.4f} rad "
+          f"| rate-limit-saturated ratio: {sat_old*100:.0f}% -> {sat_new*100:.0f}%")
+    print(f"[VERIFY] finger hold press-in bias (should barely change): {np.mean(gap_old):+.3f} -> {np.mean(gap_new):+.3f} rad")
+    print("[NOTE] the training side recomputes the normalizer with new labels; old checkpoints are incompatible, retrain.")
 
 
 if __name__ == "__main__":

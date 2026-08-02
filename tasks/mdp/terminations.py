@@ -1,6 +1,6 @@
 """
-终止条件函数定义
-基于相对高度（相对于每个 episode 的初始位置）
+Termination functions.
+Based on relative height (relative to each episode's initial position).
 """
 
 from __future__ import annotations
@@ -18,33 +18,31 @@ if TYPE_CHECKING:
 
 def check_success(
     env: ManagerBasedRLEnv,
-    lift_z_threshold: float = 0.1,  # 相对于初始位置的抬起高度
+    lift_z_threshold: float = 0.1,  # lift height relative to initial position
     drill_cfg: SceneEntityCfg = SceneEntityCfg("drill"),
 ) -> torch.Tensor:
-    """成功条件：电钻 z 轴高于初始位置超过 lift_z_threshold
-    
-    例如：lift_z_threshold=0.1 表示电钻 z 轴高于初始位置 10cm 判定成功
+    """Success: drill z is higher than initial position by more than lift_z_threshold.
+
+    e.g. lift_z_threshold=0.1 means success when the drill is 10cm above its initial z.
     """
     drill: RigidObject = env.scene[drill_cfg.name]
     drill_pos = drill.data.root_pos_w
-    # 使用 env.initial_drill_pos（每个 episode 开始时记录的完整初始位置）
+    # use env.initial_drill_pos (full initial position recorded at each episode start)
     z_diff = drill_pos[:, 2] - env.initial_drill_pos[:, 2]
     return z_diff > lift_z_threshold
 
 
 def check_failure(
     env: ManagerBasedRLEnv,
-    fall_dist: float = 0.05,  # 相对于初始位置的下降距离
+    fall_dist: float = 0.05,  # drop distance relative to initial position
     drill_cfg: SceneEntityCfg = SceneEntityCfg("drill"),
 ) -> torch.Tensor:
-    """失败条件：电钻 z 轴低于初始位置超过 fall_dist
+    """Failure: drill z is lower than initial position by more than fall_dist.
 
-    例如：fall_dist=0.05 表示电钻 z 轴低于初始位置 5cm 判定失败
+    e.g. fall_dist=0.05 means failure when the drill is 5cm below its initial z.
     """
     drill: RigidObject = env.scene[drill_cfg.name]
     drill_pos = drill.data.root_pos_w
-    # 使用 env.initial_drill_pos（每个 episode 开始时记录的完整初始位置）
+    # use env.initial_drill_pos (full initial position recorded at each episode start)
     z_diff = env.initial_drill_pos[:, 2] - drill_pos[:, 2]
     return z_diff > fall_dist
-
-
