@@ -1,10 +1,15 @@
-# inspire_drill
+# Learning-based Functional Grasping for Dexterous Hands
 
-A simulation research platform for **dexterous power-drill manipulation**: a Franka arm with an Inspire five-finger hand (13 controlled joints — 7 arm + 6 hand) must pick a drill up off the table and then align it to a target pose in front of a plate.
+**Master's thesis · Technical University of Munich (TUM)**<br>
+Supervisors: Qian Feng, Zitao Zhang
 
-## What this repo is for
+Simulation environments, data pipeline and training/evaluation code for the thesis. The platform is built on Isaac Lab and targets a 13-DoF system: a 7-DoF Franka arm equipped with a 6-DoF Inspire five-finger hand.
 
-Reinforcement learning solves this task easily *if* you let the policy cheat — feed it the drill's exact pose, contact forces, and velocities from the simulator. None of that exists on a real robot. So the workflow here is **teacher → student distillation**:
+## Overview
+
+A *functional* grasp is one that not only immobilises an object but acquires it in the configuration required to operate it. For a hand-held power tool this means the palm and thumb engage the handle, the index finger reaches the trigger, and the tool axis remains free to be aimed — a considerably narrower set of admissible hand–object configurations than force closure alone. This work formulates functional grasping of a power drill as a two-stage manipulation problem (grasp, then alignment of the drill towards a target) and studies which observations a deployable, vision-based policy actually requires in order to solve it.
+
+Reinforcement learning solves the task reliably when the policy is granted privileged access to simulator state — exact object pose, per-link contact forces, and object velocities. None of these quantities are observable on hardware, so such a policy is not deployable. The pipeline therefore follows a **privileged-teacher / visuomotor-student distillation** scheme:
 
 ```
   PPO teacher  ──rollout──>  zarr dataset  ──train──>  DP3 student  ──eval──>  success rate
@@ -12,27 +17,62 @@ Reinforcement learning solves this task easily *if* you let the policy cheat —
                              proprioception)           proprioception)         pose set)
 ```
 
-1. Train a privileged RL teacher (rl_games PPO) on full simulator state.
-2. Roll the teacher out and record only what a real robot could observe: a depth-camera point cloud plus joint proprioception, paired with the joint targets the teacher executed.
-3. Train a [3D Diffusion Policy](https://github.com/YanjieZe/3D-Diffusion-Policy) (DP3) student on that dataset (in the sibling repo).
-4. Deploy the student back into the same environment and score it against fixed initial poses.
+1. A privileged teacher is trained with PPO (rl_games) on full simulator state.
+2. The teacher is rolled out and only hardware-observable quantities are recorded — a depth-camera point cloud and joint proprioception — paired with the joint targets the teacher executed.
+3. A [3D Diffusion Policy](https://github.com/YanjieZe/3D-Diffusion-Policy) (DP3) student is trained on this dataset by behaviour cloning (sibling repository).
+4. The student is deployed in the same environment and evaluated against a fixed set of initial object poses.
 
-The reason the code is structured this way is **ablation**: the whole point is asking *what does the student actually need to see?* The observation is assembled from swappable segments — fixed camera vs. wrist camera, whether to include a robot-FK point cloud, a ground-truth handle mask channel, joint positions alone vs. positions + applied joint torques, and a contact-gated torque branch supervised by privileged per-link contact forces. Data collection and deployment share the same `perception/` code so that a change in the observation is the *only* difference between two runs, and every checkpoint is graded on the same policy-independent Sobol pose set (`--init_pose_file`) so success rates are directly comparable.
+**Research question and experimental design.** The central question is which components of the observation are necessary for functional grasping, in particular whether proprioceptive force information contributes beyond geometry. The observation is therefore assembled from interchangeable segments: point-cloud composition (external fixed camera, wrist-mounted camera, forward-kinematics robot cloud, ground-truth handle segmentation channel), proprioception (joint positions alone versus joint positions with applied joint torques), and the contact-gated torque branch that constitutes the main methodological contribution of this thesis (detailed in the next section). Data collection and deployment share the same `perception/` implementation, so the observation remains the only controlled variable between two runs, and every checkpoint is evaluated on an identical, policy-independent Sobol pose set (`--init_pose_file`), which makes reported success rates directly comparable across ablations.
 
-Three drill variants (`drill2`, `drill_blue`, `drill_yellow`) with different geometry and scale are trained and evaluated together, and success is reported per variant.
+Generalisation across object geometry is assessed with three drill variants (`drill2`, `drill_blue`, `drill_yellow`) differing in shape, scale and handle geometry; all variants are trained jointly and success is reported per variant.
 
 ---
 
-## The two tasks
+## Contribution: contact-gated joint torque as a proprioceptive modality
 
-| | **Task 1 — grasp** | **Task 2 — align** |
+**Motivation.** A dexterous hand occludes precisely the region that matters at the moment it matters: once the fingers close around the handle, the point cloud near the contact region is at its least informative for the remainder of the episode. Joint torque is the one signal that reports contact directly (τ_ext = Jᵀ F_ext), is available on the real platform, and requires no additional sensor. Simply concatenating it to the state vector, however, does not help — that is the "feature concatenation" baseline, which prior work measures as indistinguishable from vision-only.
+
+**Why raw torque fails.** In free space the measured joint torque is dominated by gravity and inertia rather than contact, so most of its variance encodes task phase, not interaction. Two further obstacles were quantified on the collected dataset:
+
+- *Scale.* The empirical extrema of the torque channels are the actuator effort limits (±87 / ±40 / ±10 N·m), reached in ≤0.8 % of frames. Min–max normalisation therefore compresses 98 % of the data into roughly 12 % of the normalised range (σ = 0.106, against 0.522 for the action channels). Since the per-channel signal-to-noise ratio of a diffusion model at step *t* is SNR<sub>t</sub> = ᾱ<sub>t</sub>σ²/(1−ᾱ<sub>t</sub>), a five-fold smaller σ is a twenty-five-fold lower SNR: the torque channels drop below unit SNR at t ≈ 5 and are therefore indistinguishable from noise for roughly 95 % of training steps.
+- *Structure.* The seven arm torque dimensions have about ten times the standard deviation of the finger dimensions and are gravity-dominated, so passing the full vector through a shared encoder propagates the noisiest channels while only cleaning the quiet ones.
+
+**Method.** The proposed treatment has three components:
+
+1. **Percentile normalisation of the torque block.** The torque channels are scaled by their p1/p99 quantiles instead of their extrema, raising σ to ≈ 0.44 — the same order as the action and joint-position channels. The ~2 % of saturation frames that then fall outside the normalised range are clamped inside the policy rather than in the dataset, so that training and deployment apply an identical transform (`task.dataset.torque_start` together with `policy.clamp_agent_pos`).
+2. **Split state encoder.** Joint positions and joint torques are embedded by separate MLP branches before concatenation with the point-cloud feature, so that the force pathway can be modulated independently of the kinematic one (`policy.state_split`).
+3. **Contact-gated force branch.** A gate φ = σ(MLP(τ<sub>finger</sub>)) modulates the force branch, either at its input (τ<sub>in</sub> = φ·τ + (1−φ)·τ<sub>free</sub>) or at its output feature (f = φ·f<sub>torque</sub> + (1−φ)·f\*), where τ<sub>free</sub> and f\* are *learned* free-space embeddings, so that "not in contact" remains distinguishable from "in contact with zero net torque". Left to the diffusion objective alone such a gate collapses towards a constant — the failure mode reported for a learned mixture-of-experts router in prior work — so it is supervised explicitly by binary cross-entropy against privileged per-link contact forces recorded during collection. **The contact labels enter the loss only, never the network input**, so the deployed policy remains restricted to hardware-observable quantities.
+
+**Design decisions, each grounded in a measurement on the collected data.** The gate is per-finger rather than a single global scalar, because 44 % of contact frames are partial contact (one to five fingers), and per-finger contact is predictable from the matching joint's torque at AUC 0.93–0.98 versus 0.67–0.75 from a global torque magnitude. The gate observes finger signals only: arm joint angles alone predict finger contact at AUC 0.857, a pure task-phase shortcut that carries no contact information and that the gate would otherwise learn in place of the physics. The arm torque dimensions are excluded from the branch entirely. Optionally, the thresholded 0/1 gate label is replaced by a graded target log(1+|F|)/log(1+c<sub>ref</sub>), since contact force spans more than a decade (in-contact p10 2.6–8.3 N, p50 14–29 N, p90 36–67 N) and a hard label collapses that range onto a single value.
+
+**Ablation axes.** The corresponding configurations are selected on the collection side and in the student's task/policy configuration:
+
+| Condition | Data flags (`collect_dp3_data.py`) | Student configuration |
+|---|---|---|
+| Vision + joint positions (baseline) | — | `agent_pos` 13-d |
+| + raw joint torque | `--force_state` | `agent_pos` 26-d, `state_split` |
+| + percentile torque normalisation | `--force_state` | `task.dataset.torque_start=13`, `policy.clamp_agent_pos=true` |
+| + contact gate | `--force_state --save_contact` | `policy.contact_gate.enabled=true`, `scope=per_finger\|global`, `gate_position=input\|feature`, `soft_label=true\|false` |
+| Torque as auxiliary objective only | `--force_state` | `policy.state_obs_dim=13` (+ `policy.aux_torque`): torque supervises the predicted trajectory but is withheld from the encoder |
+
+Every condition is trained from the same demonstrations and evaluated with the protocol described below, so that differences in success rate are attributable to the observation and its treatment alone.
+
+---
+
+## Task formulation
+
+The problem is decomposed into two stages, each realised as a separate Isaac Lab environment:
+
+| | **Stage 1 — functional grasp** | **Stage 2 — alignment** |
 |---|---|---|
 | env | `tasks/grasp_drill_env.py` (`GraspDrillEnv`) | `tasks/stage2_env.py` (`Stage2Env`) |
-| start state | drill on the table at a randomized pose | drill **already grasped** (reset from a pkl of successful grasp end-states) |
-| goal | lift the drill off the table and hold it | bring the drill to a target orientation in front of the plate |
-| success | drill held for ≥20 of the last 50 steps | alignment held for `--success_hold_stop` consecutive steps |
+| initial state | drill resting on the table at a randomised pose | drill **already grasped** (reset from recorded successful grasp end-states) |
+| objective | lift and hold the drill with the index finger at the trigger and the thumb at the variant-specific handle contact point | bring the grasped drill to a target orientation in front of the plate |
+| success | drill held in the target configuration for ≥20 of the last 50 steps | alignment maintained for `--success_hold_stop` consecutive steps |
 
-`tasks/chained_env.py` (`ChainedEnv`) runs both in one episode: it starts in phase 0 (grasp) and switches to phase 1 (align) the moment the grasp criterion fires. `--stage1_only` uses the same env but terminates at that switch point — the grasp-only setting used for most of the DP3 work here.
+Stage 1 is where functionality is enforced: the reward shapes the fingertip–trigger and thumb–handle distances under an orientation gate, so a grasp that is stable but does not afford operation of the tool is not rewarded. Stage 2 verifies functionality downstream, since only a correctly acquired drill can be aimed at the target.
+
+`tasks/chained_env.py` (`ChainedEnv`) executes both stages within a single episode, starting in phase 0 (grasp) and switching to phase 1 (alignment) once the grasp criterion is met. The flag `--stage1_only` uses the same environment but terminates at the switching point; this grasp-only setting is used for the majority of the student experiments reported here.
 
 ---
 
